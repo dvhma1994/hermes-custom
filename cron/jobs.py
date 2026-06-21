@@ -312,6 +312,16 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     if schedule_lower.startswith("every "):
         duration_str = schedule[6:].strip()
         minutes = parse_duration(duration_str)
+        # A recurring interval of 0 (or anything non-positive) makes
+        # compute_next_run() return now every tick, so the scheduler fires
+        # the job on every loop forever (runaway). Reject it at parse time —
+        # this covers create_job() and update_job() since both route through
+        # parse_schedule().
+        if minutes <= 0:
+            raise ValueError(
+                f"Invalid recurring interval 'every {duration_str}': "
+                "interval must be >= 1 minute"
+            )
         return {
             "kind": "interval",
             "minutes": minutes,
@@ -320,17 +330,27 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     
     # Check for cron expression (5 or 6 space-separated fields)
     # Cron fields: minute hour day month weekday [year]
+    # Each field is allowed to contain letters (named weekdays MON-SUN and
+    # months JAN-DEC) plus the standard cron symbols (* , - /) and Quartz-style
+    # tokens (L last, W nearest weekday, # Nth, ? any). This is a coarse
+    # "looks cron-like" pre-filter; the real validation is delegated to
+    # croniter below so that valid expressions like '0 9 * * MON' are no
+    # longer rejected by a digits-only field check.
     parts = schedule.split()
     if len(parts) >= 5 and all(
-        re.match(r'^[\d\*\-,/]+$', p) for p in parts[:5]
+        re.match(r'^[A-Za-z\d\*\-,/#+?]+$', p) for p in parts[:5]
     ):
         if not HAS_CRONITER:
             raise ValueError("Cron expressions require 'croniter' package. Install with: pip install croniter")
-        # Validate cron expression
+        # Validate via croniter.is_valid(), which accepts named DOW/month
+        # fields (MON, JAN, ...) and is the source of truth for what counts
+        # as a valid cron expression.
         try:
-            croniter(schedule)
+            valid = croniter.is_valid(schedule)
         except Exception as e:
             raise ValueError(f"Invalid cron expression '{schedule}': {e}")
+        if not valid:
+            raise ValueError(f"Invalid cron expression '{schedule}'")
         return {
             "kind": "cron",
             "expr": schedule,
@@ -373,6 +393,47 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
         f"  - Cron: '0 9 * * *' (cron expression)\n"
         f"  - Timestamp: '2026-02-03T14:00:00' (one-shot at time)"
     )
+
+
+def _validate_parsed_schedule(schedule: Dict[str, Any]) -> None:
+    """Enforce parse_schedule's invariants on an already-parsed schedule dict.
+
+    ``parse_schedule()`` is the canonical entry point and already enforces these
+    rules, but callers can hand ``update_job`` a pre-shaped ``schedule`` dict
+    directly (e.g. the HTTP ``PATCH /api/jobs/{id}`` endpoint copies the JSON
+    body verbatim, and hand-edited jobs.json records exist in the wild). That
+    path skips ``parse_schedule`` and must not be able to land a schedule in
+    storage that violates the BUG #5 / BUG #11 invariants — namely:
+
+      * a recurring ``interval`` with a non-positive ``minutes`` (makes
+        ``compute_next_run`` return ``now`` every tick → scheduler runaway), and
+      * a ``cron`` expression that croniter rejects as invalid.
+
+    Raises ``ValueError`` on violation; returns ``None`` on success.
+    """
+    if not isinstance(schedule, dict):
+        raise ValueError(f"Schedule must be a parsed dict, got {type(schedule).__name__}")
+    kind = schedule.get("kind")
+
+    if kind == "interval":
+        minutes = schedule.get("minutes")
+        if not isinstance(minutes, int) or minutes <= 0:
+            raise ValueError(
+                f"Invalid recurring interval: minutes={minutes!r}; "
+                "interval must be >= 1 minute"
+            )
+
+    elif kind == "cron":
+        expr = schedule.get("expr")
+        if not isinstance(expr, str) or not expr.strip():
+            raise ValueError(f"Invalid cron expression: {expr!r}")
+        if HAS_CRONITER:
+            try:
+                valid = croniter.is_valid(expr)
+            except Exception as e:
+                raise ValueError(f"Invalid cron expression '{expr}': {e}")
+            if not valid:
+                raise ValueError(f"Invalid cron expression '{expr}'")
 
 
 def _ensure_aware(dt: datetime) -> datetime:
@@ -864,6 +925,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if isinstance(updated_schedule, str):
                     updated_schedule = parse_schedule(updated_schedule)
                     updated["schedule"] = updated_schedule
+                else:
+                    # A pre-shaped dict skips parse_schedule, so re-enforce its
+                    # invariants here. This closes the dict-bypass that
+                    # otherwise lets PATCH /api/jobs/{id} store minutes=0
+                    # (runaway) or an invalid cron expression.
+                    _validate_parsed_schedule(updated_schedule)
                 updated["schedule_display"] = updates.get(
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),

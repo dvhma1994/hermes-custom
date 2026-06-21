@@ -110,6 +110,59 @@ class TestParseSchedule:
         with pytest.raises(ValueError):
             parse_schedule("99 99 99 99 99")
 
+    # -- Regression: BUG #5 — recurring interval of 0 is a scheduler runaway --
+    # A non-positive interval makes compute_next_run() yield next_run == now,
+    # so the scheduler re-fires the job every tick forever. Reject at parse.
+    def test_every_zero_minutes_rejected(self):
+        with pytest.raises(ValueError, match=">= 1 minute"):
+            parse_schedule("every 0m")
+
+    def test_every_zero_hours_rejected(self):
+        with pytest.raises(ValueError, match=">= 1 minute"):
+            parse_schedule("every 0h")
+
+    def test_every_zero_days_rejected(self):
+        with pytest.raises(ValueError, match=">= 1 minute"):
+            parse_schedule("every 0d")
+
+    def test_every_one_minute_still_works(self):
+        result = parse_schedule("every 1m")
+        assert result["kind"] == "interval"
+        assert result["minutes"] == 1
+
+    def test_every_zero_rejected_at_create_time(self, tmp_cron_dir):
+        """create_job routes through parse_schedule, so the guard applies."""
+        with pytest.raises(ValueError, match=">= 1 minute"):
+            create_job(prompt="runaway", schedule="every 0m")
+
+    # -- Regression: BUG #11 — named weekday/month cron fields rejected --
+    # croniter accepts named DOW (MON-SUN) and months (JAN-DEC); parse_schedule
+    # must too, detecting them as kind='cron'.
+    def test_cron_named_weekday_mon(self):
+        pytest.importorskip("croniter")
+        result = parse_schedule("0 9 * * MON")
+        assert result["kind"] == "cron"
+        assert result["expr"] == "0 9 * * MON"
+
+    def test_cron_named_month_jan(self):
+        pytest.importorskip("croniter")
+        result = parse_schedule("0 0 1 JAN *")
+        assert result["kind"] == "cron"
+        assert result["expr"] == "0 0 1 JAN *"
+
+    def test_cron_named_dow_and_month_combined(self):
+        pytest.importorskip("croniter")
+        result = parse_schedule("0 0 * JAN MON")
+        assert result["kind"] == "cron"
+        assert result["expr"] == "0 0 * JAN MON"
+
+    def test_numeric_cron_still_works(self):
+        """Ensure the broadened field regex didn't break numeric cron input."""
+        pytest.importorskip("croniter")
+        result = parse_schedule("*/5 * * * *")
+        assert result["kind"] == "cron"
+        assert result["expr"] == "*/5 * * * *"
+
 
 # =========================================================================
 # compute_next_run
@@ -301,6 +354,54 @@ class TestUpdateJob:
         fetched = get_job(job["id"])
         assert fetched["schedule"]["minutes"] == 120
         assert fetched["schedule_display"] == "every 120m"
+
+    # -- Regression: BUG #5/BUG #11 dict-bypass via update_job --
+    # update_job accepts a pre-parsed schedule dict (e.g. from PATCH /api/jobs).
+    # That path skips parse_schedule, so the invariants must be re-enforced
+    # or a caller could store minutes=0 (runaway) / invalid cron.
+    def test_update_schedule_dict_rejects_zero_interval(self, tmp_cron_dir):
+        job = create_job(prompt="ok", schedule="every 1h")
+        bad = {"kind": "interval", "minutes": 0, "display": "every 0m"}
+        with pytest.raises(ValueError, match=">= 1 minute"):
+            update_job(job["id"], {"schedule": bad})
+
+    def test_update_schedule_dict_rejects_invalid_cron(self, tmp_cron_dir):
+        pytest.importorskip("croniter")
+        job = create_job(prompt="ok", schedule="every 1h")
+        bad = {"kind": "cron", "expr": "99 99 99 99 99", "display": "99 99 99 99 99"}
+        with pytest.raises(ValueError, match="Invalid cron expression"):
+            update_job(job["id"], {"schedule": bad})
+
+    def test_update_schedule_dict_accepts_valid_cron_named(self, tmp_cron_dir):
+        """A valid named-DOW cron supplied as a dict must pass validation."""
+        pytest.importorskip("croniter")
+        job = create_job(prompt="ok", schedule="every 1h")
+        good = {"kind": "cron", "expr": "0 9 * * MON", "display": "0 9 * * MON"}
+        updated = update_job(job["id"], {"schedule": good})
+        assert updated is not None
+        assert updated["schedule"]["kind"] == "cron"
+        assert updated["schedule"]["expr"] == "0 9 * * MON"
+
+    def test_validate_parsed_schedule_helper(self):
+        """Unit-test the invariant helper directly."""
+        from cron.jobs import _validate_parsed_schedule
+        # valid interval
+        _validate_parsed_schedule({"kind": "interval", "minutes": 5})
+        # valid cron
+        if pytest.importorskip("croniter") is not None:
+            _validate_parsed_schedule({"kind": "cron", "expr": "0 9 * * *"})
+            _validate_parsed_schedule({"kind": "cron", "expr": "0 9 * * MON"})
+        # invalid interval
+        with pytest.raises(ValueError, match=">= 1 minute"):
+            _validate_parsed_schedule({"kind": "interval", "minutes": 0})
+        with pytest.raises(ValueError):
+            _validate_parsed_schedule({"kind": "interval", "minutes": -5})
+        # invalid cron
+        with pytest.raises(ValueError, match="Invalid cron expression"):
+            _validate_parsed_schedule({"kind": "cron", "expr": "99 99 99 99 99"})
+        # non-dict
+        with pytest.raises(ValueError):
+            _validate_parsed_schedule("every 1h")
 
     def test_update_enable_disable(self, tmp_cron_dir):
         job = create_job(prompt="Toggle me", schedule="every 1h")
