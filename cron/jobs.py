@@ -41,8 +41,16 @@ from utils import atomic_replace
 try:
     from croniter import croniter
     HAS_CRONITER = True
+    try:
+        # Raised by get_next() for impossible-but-well-formed expressions
+        # (e.g. "0 9 31 2 *" = Feb 31). Older croniter builds may not export it,
+        # so fall back to a broad base in that case.
+        from croniter import CroniterBadDateError as _CroniterBadDateError
+    except Exception:  # pragma: no cover - depends on croniter version
+        _CroniterBadDateError = Exception
 except ImportError:
     HAS_CRONITER = False
+    _CroniterBadDateError = Exception
 
 # =============================================================================
 # Configuration
@@ -434,6 +442,17 @@ def _validate_parsed_schedule(schedule: Dict[str, Any]) -> None:
                 raise ValueError(f"Invalid cron expression '{expr}': {e}")
             if not valid:
                 raise ValueError(f"Invalid cron expression '{expr}'")
+            # is_valid() accepts impossible-but-well-formed expressions (e.g.
+            # "0 9 31 2 *" = Feb 31). get_next() then raises and would crash the
+            # whole scheduler tick, so probe it here and reject at validation time.
+            try:
+                croniter(expr, _hermes_now()).get_next(datetime)
+            except _CroniterBadDateError as e:
+                raise ValueError(
+                    f"Cron expression '{expr}' never yields a valid date: {e}"
+                )
+            except Exception as e:
+                raise ValueError(f"Invalid cron expression '{expr}': {e}")
 
 
 def _ensure_aware(dt: datetime) -> datetime:
@@ -554,7 +573,19 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         if last_run_at:
             base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
         cron = croniter(schedule["expr"], base_time)
-        next_run = cron.get_next(datetime)
+        try:
+            next_run = cron.get_next(datetime)
+        except _CroniterBadDateError:
+            # Impossible-but-well-formed cron (e.g. "0 9 31 2 *"). Returning None
+            # disables only this one job instead of crashing the whole tick — the
+            # scheduler treats None as "no next run". Validation normally rejects
+            # these at create time; this guards already-stored or hand-edited jobs.
+            logger.warning(
+                "Cron expression %r yields no valid next date; job will not be "
+                "rescheduled (disabled).",
+                schedule.get("expr"),
+            )
+            return None
         return next_run.isoformat()
 
     return None

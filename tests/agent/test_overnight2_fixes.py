@@ -208,3 +208,35 @@ def test_filter_tool_scope_handles_none_function():
     import agent.runtime_authority as ra
     kept = ra.filter_tool_scope([{"function": None, "name": "mytool"}], frozenset({"mytool"}))
     assert len(kept) == 1
+
+
+# ── Hunt-2 #1 (HIGH): an impossible-but-well-formed cron expression (e.g.
+# "0 9 31 2 *" = Feb 31) passes croniter.is_valid() but raises CroniterBadDateError
+# from get_next(), which crashed the whole scheduler tick (DoS of every job). The
+# fix rejects such expressions at validation time AND makes compute_next_run return
+# None (disable just that one job) instead of propagating the crash. ───────────────
+import pytest
+
+_IMPOSSIBLE_CRON = "0 9 31 2 *"   # 09:00 on Feb 31 — never occurs
+_VALID_CRON = "0 9 * * *"          # 09:00 daily
+
+
+def test_impossible_cron_rejected_at_validation():
+    from cron.jobs import _validate_parsed_schedule, HAS_CRONITER
+    if not HAS_CRONITER:
+        pytest.skip("croniter not installed")
+    with pytest.raises(ValueError):
+        _validate_parsed_schedule({"kind": "cron", "expr": _IMPOSSIBLE_CRON})
+    # a real cron must still validate cleanly
+    _validate_parsed_schedule({"kind": "cron", "expr": _VALID_CRON})
+
+
+def test_impossible_cron_compute_next_run_returns_none_not_raises():
+    from cron.jobs import compute_next_run, HAS_CRONITER
+    if not HAS_CRONITER:
+        pytest.skip("croniter not installed")
+    # Pre-fix this raised CroniterBadDateError and aborted the tick.
+    assert compute_next_run({"kind": "cron", "expr": _IMPOSSIBLE_CRON}) is None
+    # a valid cron still yields a concrete next-run timestamp
+    nxt = compute_next_run({"kind": "cron", "expr": _VALID_CRON})
+    assert isinstance(nxt, str) and nxt
