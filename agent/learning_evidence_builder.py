@@ -178,6 +178,11 @@ class LearningEvidenceBuilder:
             "synthetic": opval_session.get("synthetic"),
             "opval_enabled": opval_session.get("opval_enabled"),
             "promotion_score": opval_session.get("promotion_score"),
+            # Additive (backward-compatible) signals so effectiveness scoring has
+            # real variance to learn from: promotion_score is frequently 0/unset,
+            # while these session-level aggregates actually vary across sessions.
+            "session_quality_score": opval_session.get("session_quality_score"),
+            "session_tool_correctness": opval_session.get("session_tool_correctness"),
             "drift_pct": opval_session.get("drift_pct"),
             "misalignment_pct": opval_session.get("misalignment_pct"),
         }

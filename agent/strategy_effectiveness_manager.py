@@ -78,11 +78,24 @@ class StrategyEffectivenessManager:
 
         for obs in observations:
             payload = self._parse_payload(obs.get("payload_json", "{}"))
-            # Prefer session-level aggregate values when present
-            promotion_score = payload.get("promotion_score") or payload.get("quality_score") or 0.0
+            # Prefer an explicit promotion score; otherwise derive a quality
+            # signal from the session-level aggregates. promotion_score is often
+            # 0/unset (no usable variance), whereas session_quality_score and
+            # session_tool_correctness genuinely vary across sessions — using them
+            # gives the loop a real signal to discriminate on instead of a flat 0.
             drift_pct = payload.get("drift_pct") or 0.0
             misalignment_pct = payload.get("misalignment_pct") or 0.0
-            score = float(promotion_score) * 100.0
+            promotion_score = payload.get("promotion_score") or payload.get("quality_score")
+            if promotion_score:
+                score = float(promotion_score) * 100.0
+            else:
+                _parts = [
+                    float(v) for v in (
+                        payload.get("session_quality_score"),
+                        payload.get("session_tool_correctness"),
+                    ) if v is not None
+                ]
+                score = (sum(_parts) / len(_parts) * 100.0) if _parts else 0.0
             # Alignment derived from 1 - misalignment, clamped
             alignment = max(0.0, 1.0 - float(misalignment_pct)) * 100.0
             scores.append(score)
