@@ -37,13 +37,15 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from agent.model_metadata import estimate_request_tokens_rough
-from agent.compression_rt02_shim import compress_context_rt02
 
 logger = logging.getLogger(__name__)
 
-# RT-02: route compression through the RT-02 shim for atomic rotation,
-# idempotency, lineage tracking, and rollback token generation.
-compress_context = compress_context_rt02
+# RT-02 NOTE: a `compress_context_rt02` shim exists (atomic rotation / idempotency
+# / lineage / rollback), but it is NOT wired in. The previous module-level binding
+# `compress_context = compress_context_rt02` here was DEAD — immediately shadowed
+# by the `def compress_context` below, which is the authoritative implementation.
+# Activating RT-02 changes the core compression path and must be validated in
+# isolation first, so it is left dormant rather than silently half-enabled.
 
 # Stable marker the gateway matches on to re-tag the auto-compaction lifecycle
 # status as ``kind="compacting"`` (tui_gateway/server.py::_status_update), so
@@ -475,6 +477,17 @@ def compress_context(
         if not _existing_sp:
             _existing_sp = agent._build_system_prompt(system_message)
         _release_lock()  # compression aborted — no rotation will happen
+        return messages, _existing_sp
+
+    # No-op guard: compression succeeded but produced no actual reduction (same or
+    # more messages). Do NOT rotate/split the session — that forks the live
+    # conversation for zero benefit. Return unchanged; callers detect the no-op
+    # via len(returned) == len(input).
+    if len(compressed) >= len(messages):
+        _existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not _existing_sp:
+            _existing_sp = agent._build_system_prompt(system_message)
+        _release_lock()
         return messages, _existing_sp
 
     summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
