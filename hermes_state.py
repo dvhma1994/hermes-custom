@@ -1774,13 +1774,16 @@ class SessionDB:
         new_expires = now + ttl_seconds
 
         def _do(conn):
-            conn.execute(
+            # Decide success from THIS statement's rowcount, not the
+            # connection's cumulative total_changes — a non-owner's UPDATE
+            # matches 0 rows but total_changes is inflated by prior writes.
+            cur = conn.execute(
                 "UPDATE compression_locks "
                 "SET heartbeat_at = ?, expires_at = ? "
                 "WHERE session_id = ? AND holder = ?",
                 (now, new_expires, session_id, holder),
             )
-            return conn.total_changes > 0
+            return cur.rowcount > 0
 
         try:
             return bool(self._execute_write(_do))
@@ -2131,13 +2134,17 @@ class SessionDB:
             return False
         now = time.time()
         def _do(conn):
-            conn.execute(
+            # Decide success from THIS statement's rowcount, not the
+            # connection's cumulative total_changes — INSERT OR IGNORE on a
+            # duplicate key inserts 0 rows but total_changes is inflated by
+            # prior writes.
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO idempotency_keys "
                 "(key, session_id, trigger, result_json, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (key, session_id, trigger, result_json, now),
             )
-            return conn.total_changes > 0
+            return cur.rowcount > 0
         try:
             return bool(self._execute_write(_do))
         except sqlite3.Error as exc:
@@ -2250,11 +2257,15 @@ class SessionDB:
         if not session_id:
             return False
         def _do(conn):
-            conn.execute(
+            # Decide success from THIS statement's rowcount, not the
+            # connection's cumulative total_changes — an UPDATE against a
+            # non-existent session matches 0 rows but total_changes is
+            # inflated by prior writes.
+            cur = conn.execute(
                 "UPDATE sessions SET lineage_version = lineage_version + 1 WHERE id = ?",
                 (session_id,),
             )
-            return conn.total_changes > 0
+            return cur.rowcount > 0
         try:
             return bool(self._execute_write(_do))
         except sqlite3.Error as exc:

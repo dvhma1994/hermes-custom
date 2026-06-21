@@ -4158,3 +4158,53 @@ class TestListCronJobRuns:
         detail = " ".join(row[-1] for row in plan)
         assert "USING INDEX" in detail or "USING COVERING INDEX" in detail, detail
         assert "idx_sessions_source" in detail, detail
+
+
+# =========================================================================
+# RT-BUG: rowcount-vs-total_changes regression (BUG #3, #15, #16)
+#
+# Three boolean methods decided success from the connection's CUMULATIVE
+# total_changes counter instead of the per-statement rowcount. A non-matching
+# UPDATE / INSERT-OR-IGNORE-duplicate reports 0 rows for the statement but
+# total_changes is still > 0 because of earlier writes on the same connection,
+# so they wrongly returned True.
+#
+# Each negative test deliberately performs a prior write so total_changes is
+# genuinely > 0 — without that, even buggy code returns False and the bug is
+# not exercised.
+# =========================================================================
+class TestRowcountRegressions:
+    def test_renew_heartbeat_owner_succeeds(self, db):
+        db.create_session(session_id="s1", source="cli")
+        assert db.try_acquire_compression_lock("s1", "owner") is True
+        # Owner renews its own lock — must succeed.
+        assert db.renew_compression_lock_heartbeat("s1", "owner") is True
+
+    def test_renew_heartbeat_non_owner_returns_false(self, db):
+        db.create_session(session_id="s1", source="cli")
+        assert db.try_acquire_compression_lock("s1", "owner") is True
+        # A different holder must NOT be able to renew; only the real owner.
+        assert db.renew_compression_lock_heartbeat("s1", "impostor") is False
+
+    def test_store_idempotency_key_first_call_true(self, db):
+        db.create_session(session_id="s1", source="cli")
+        ok = db.store_idempotency_key("k1", "s1", "trigger", "{}")
+        assert ok is True
+
+    def test_store_idempotency_key_duplicate_returns_false(self, db):
+        db.create_session(session_id="s1", source="cli")
+        assert db.store_idempotency_key("k1", "s1", "trigger", "{}") is True
+        # Same key again — INSERT OR IGNORE inserts 0 rows, must report False.
+        assert db.store_idempotency_key("k1", "s1", "trigger", "{}") is False
+
+    def test_increment_lineage_version_existing_session_true(self, db):
+        db.create_session(session_id="s1", source="cli")
+        before = db.get_lineage_version("s1")
+        assert db.increment_lineage_version("s1") is True
+        assert db.get_lineage_version("s1") == before + 1
+
+    def test_increment_lineage_version_missing_session_false(self, db):
+        # A prior write (create_session) inflates total_changes, which is the
+        # exact condition under which the buggy code returned True.
+        db.create_session(session_id="s1", source="cli")
+        assert db.increment_lineage_version("no_such_session") is False
