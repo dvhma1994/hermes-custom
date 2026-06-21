@@ -69,3 +69,15 @@ def test_split_text_chunks_respects_utf16_limit_for_wide_chars():
     assert "".join(chunks) == text                    # no data lost
     # ASCII path (len_fn=len) unchanged
     assert all(len(c) <= 100 for c in split("a" * 250, 100))
+
+
+# ── Bug #12: session_reset at_hour/idle_minutes weren't int-coerced (quoted YAML
+# scalar crashed validation); a single exclude string was char-split by tuple(). ──
+def test_session_reset_policy_coerces_and_handles_string_exclude():
+    from gateway.config import SessionResetPolicy
+    p = SessionResetPolicy.from_dict(
+        {"at_hour": "4", "idle_minutes": "30", "notify_exclude_platforms": "api_server"})
+    assert p.at_hour == 4 and isinstance(p.at_hour, int)
+    assert p.idle_minutes == 30 and isinstance(p.idle_minutes, int)
+    assert p.notify_exclude_platforms == ("api_server",)   # one platform, not chars
+    assert SessionResetPolicy.from_dict({"at_hour": "oops"}).at_hour == 4   # bad -> default
