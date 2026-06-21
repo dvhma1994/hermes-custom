@@ -1375,11 +1375,22 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     try:
-        entries = [_managed_file_entry(policy, child) for child in target.iterdir()]
+        children = list(target.iterdir())
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not read directory: {exc}")
+
+    # A single un-stat-able child (dangling symlink, ACL-restricted entry)
+    # raises HTTPException from _managed_file_entry; skip it so the whole
+    # listing still succeeds — matches /api/fs/list which tolerates dangling
+    # links instead of failing the entire directory read.
+    entries = []
+    for child in children:
+        try:
+            entries.append(_managed_file_entry(policy, child))
+        except HTTPException:
+            continue
 
     entries.sort(key=lambda item: (not item["is_directory"], str(item["name"]).lower()))
     locked_root = policy.locked_root

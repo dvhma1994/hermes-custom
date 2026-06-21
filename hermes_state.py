@@ -1908,7 +1908,12 @@ class SessionDB:
             return False
         now = time.time()
         def _do(conn):
-            conn.execute(
+            # Decide success from THIS statement's rowcount, not the
+            # connection's cumulative total_changes — INSERT OR IGNORE on a
+            # duplicate child_session_id inserts 0 rows but total_changes is
+            # inflated by prior writes on the connection, so it would wrongly
+            # report True.
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO compression_lineage "
                 "(child_session_id, parent_session_id, strategy, trigger, "
                 "tokens_before, tokens_after, content_hash, rollback_token, created_at) "
@@ -1916,7 +1921,7 @@ class SessionDB:
                 (child_session_id, parent_session_id, strategy, trigger,
                  tokens_before, tokens_after, content_hash, rollback_token, now),
             )
-            return conn.total_changes > 0
+            return cur.rowcount > 0
         try:
             return bool(self._execute_write(_do))
         except sqlite3.Error as exc:
@@ -1952,12 +1957,18 @@ class SessionDB:
                 })
         return result
 
-    def get_compression_tip(self, session_id: str) -> str:
-        """Return the tip of the compression lineage for session_id.
+    def get_compression_tip(self, session_id: str) -> Optional[str]:
+        """Return the tip of the compression chain for session_id.
 
-        Walks the lineage table from session_id following child links.
-        Cycle detection prevents infinite loops. Falls back to checking
-        sessions.parent_session_id if no lineage entry exists.
+        Prefers the authoritative ``compression_lineage`` table (written by
+        ``insert_compression_lineage``): follows its child links as far as they
+        go. From wherever lineage ends, falls back to the
+        ``sessions.parent_session_id`` / ``end_reason='compression'``
+        continuation walk so continuations not recorded in the lineage table are
+        still resolved. Cycle detection prevents infinite loops.
+
+        (Previously a second same-named method shadowed this one, so lineage
+        records were never consulted for tip resolution — bug Hunt-3 H3-20.)
         """
         if not session_id:
             return session_id
@@ -1965,16 +1976,20 @@ class SessionDB:
         current = session_id
         while current and current not in visited:
             visited.add(current)
-            row = self._conn.execute(
-                "SELECT child_session_id FROM compression_lineage "
-                "WHERE parent_session_id = ? ORDER BY created_at DESC LIMIT 1",
-                (current,),
-            ).fetchone()
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT child_session_id FROM compression_lineage "
+                    "WHERE parent_session_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (current,),
+                ).fetchone()
             if row is None:
                 break
-            child = row[0] if isinstance(row, sqlite3.Row) else row[0]
+            child = row[0]
+            if not child or child in visited:
+                break
             current = child
-        return current
+        # Continue/fall back via the sessions-based continuation chain.
+        return self._compression_tip_via_sessions(current)
 
     def detect_orphan_children(self, session_id: str) -> list:
         """Detect orphan child sessions created by split-brain compression.
@@ -2011,13 +2026,18 @@ class SessionDB:
             return False
         now = time.time()
         def _do(conn):
-            conn.execute(
+            cur = conn.execute(
                 "INSERT OR REPLACE INTO compression_checkpoints "
                 "(session_id, trigger, checkpoint_json, rollback_token, consumed, consumed_at, created_at) "
                 "VALUES (?, ?, ?, ?, 0, NULL, ?)",
                 (session_id, trigger, checkpoint_json, rollback_token, now),
             )
-            return conn.total_changes > 0
+            # Decide success from THIS statement's rowcount, not the connection's
+            # cumulative total_changes. INSERT OR REPLACE always affects a row so
+            # the old total_changes guard was accidentally correct, but on a
+            # reused connection total_changes is inflated by prior writes — the
+            # rowcount form is the consistent, refactor-safe predicate.
+            return cur.rowcount > 0
         try:
             return bool(self._execute_write(_do))
         except sqlite3.Error as exc:
@@ -2045,12 +2065,18 @@ class SessionDB:
             consumed = row[5] if not isinstance(row, sqlite3.Row) else row["consumed"]
             if consumed:
                 return None  # Already consumed
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE compression_checkpoints SET consumed = 1, consumed_at = ? "
                 "WHERE rollback_token = ? AND consumed = 0",
                 (now, rollback_token),
             )
-            if conn.total_changes == 0:
+            # Decide from THIS statement's rowcount, not the connection's
+            # cumulative total_changes. Under the lost race (a concurrent
+            # consumer flipped consumed to 1 between our SELECT and UPDATE),
+            # the UPDATE matches 0 rows even though total_changes is already
+            # > 0 from the concurrent write — so the total_changes guard never
+            # fired and the loser wrongly reported success.
+            if cur.rowcount == 0:
                 return None  # Lost race
             if isinstance(row, sqlite3.Row):
                 return {
@@ -2751,7 +2777,7 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def _compression_tip_via_sessions(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child session where:
@@ -3700,7 +3726,12 @@ class SessionDB:
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
                 f"FROM messages WHERE session_id IN ({placeholders})"
-                f"{active_clause} ORDER BY timestamp, id",
+                # ORDER BY id (global autoincrement = true insertion order), NOT
+                # timestamp: a backward wall-clock step (e.g. WSL2 clock
+                # regression) between two appends would otherwise swap their
+                # replay order. This matches get_messages() — see its docstring
+                # citing commit c03acca50.
+                f"{active_clause} ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -4652,9 +4683,22 @@ class SessionDB:
         """
         if sessions_dir is None:
             return
+        # Security: session_id is interpolated straight into filesystem paths
+        # (and a glob) below. A malicious/garbage id with a path separator,
+        # parent ref, NUL, or glob metacharacter could delete files OUTSIDE
+        # sessions_dir. Reject those, then containment-check each resolved path.
+        if not session_id or re.search(r"[/\\\x00]|\.\.|[*?\[\]]", session_id):
+            logger.warning("refusing transcript cleanup for unsafe session_id %r", session_id)
+            return
+        try:
+            sessions_dir = sessions_dir.resolve()
+        except OSError:
+            return
         for suffix in (".json", ".jsonl"):
             p = sessions_dir / f"{session_id}{suffix}"
             try:
+                if p.resolve().parent != sessions_dir:
+                    continue  # defense-in-depth: never unlink outside sessions_dir
                 p.unlink(missing_ok=True)
             except OSError:
                 pass

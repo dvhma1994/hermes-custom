@@ -174,10 +174,26 @@ def _decode_header_value(raw: str) -> str:
     decoded = []
     for part, charset in parts:
         if isinstance(part, bytes):
-            decoded.append(part.decode(charset or "utf-8", errors="replace"))
+            decoded.append(_safe_bytes_decode(part, charset))
         else:
             decoded.append(part)
     return " ".join(decoded)
+
+
+def _safe_bytes_decode(data: bytes, charset) -> str:
+    """Decode email bytes best-effort, tolerating unknown/invalid charset labels.
+
+    ``errors="replace"`` does NOT protect against an unrecognized codec NAME —
+    ``b"...".decode("unknown-8bit")`` raises LookupError before any error handler
+    runs. Real-world headers/bodies carry labels Python has no codec for
+    (``unknown-8bit``, ``x-unknown``, ``ks_c_5601-1987``, odd gb variants), so a
+    single bad message would otherwise abort the whole IMAP poll batch. Fall back
+    to latin-1, which maps all 256 byte values and never fails.
+    """
+    try:
+        return data.decode(charset or "utf-8", errors="replace")
+    except (LookupError, UnicodeError):
+        return data.decode("latin-1", errors="replace")
 
 
 def _extract_text_body(msg: email_lib.message.Message) -> str:
@@ -193,7 +209,7 @@ def _extract_text_body(msg: email_lib.message.Message) -> str:
                 payload = part.get_payload(decode=True)
                 if payload:
                     charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="replace")
+                    return _safe_bytes_decode(payload, charset)
         # Fallback: try text/html and strip tags
         for part in msg.walk():
             content_type = part.get_content_type()
@@ -204,14 +220,14 @@ def _extract_text_body(msg: email_lib.message.Message) -> str:
                 payload = part.get_payload(decode=True)
                 if payload:
                     charset = part.get_content_charset() or "utf-8"
-                    html = payload.decode(charset, errors="replace")
+                    html = _safe_bytes_decode(payload, charset)
                     return _strip_html(html)
         return ""
     else:
         payload = msg.get_payload(decode=True)
         if payload:
             charset = msg.get_content_charset() or "utf-8"
-            text = payload.decode(charset, errors="replace")
+            text = _safe_bytes_decode(payload, charset)
             if msg.get_content_type() == "text/html":
                 return _strip_html(text)
             return text

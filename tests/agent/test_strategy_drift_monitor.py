@@ -162,3 +162,29 @@ def test_baseline_ignores_old_snapshots(tmp_path):
     monitor.snapshot("strategy:coding", now=old_now)
     baseline = monitor._baseline_win_rate("strategy:coding")
     assert baseline is None
+
+
+def test_snapshot_misalignment_not_sourced_from_drift(tmp_path):
+    """BUG #6: misalignment_pct must reflect the misalignment signal
+    (derived from avg_alignment), NOT avg_drift.
+
+    drift_pct/misalignment_pct are on the production 0-100 PERCENT scale
+    (collectors store (n/total)*100). With drift_pct=12 and misalignment_pct=3,
+    the effectiveness manager yields avg_drift=0.12 (fraction) and
+    avg_alignment=100-3=97.0.  The snapshot's misalignment_pct must be ~0.03
+    (from alignment), not 0.12 (drift).
+    """
+    store = _make_store(tmp_path)
+    for _ in range(5):
+        _obs_for_session(store, str(uuid.uuid4()),
+                         outcome="success", score=0.9,
+                         drift=12.0, misalignment=3.0)
+    monitor = StrategyDriftMonitor(store._conn)
+    snap = monitor.snapshot("strategy:coding")
+
+    eff = monitor._effectiveness.evaluate("strategy:coding")
+    expected_misalign = max(0.0, 1.0 - eff.avg_alignment / 100.0)
+    assert abs(expected_misalign - 0.03) < 0.01          # sanity: alignment=97 -> 0.03
+    assert abs(snap.misalignment_pct - expected_misalign) < 0.01
+    # must NOT equal avg_drift
+    assert abs(snap.misalignment_pct - eff.avg_drift) > 0.01

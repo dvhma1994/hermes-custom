@@ -641,7 +641,13 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if not skill_matches_environment(frontmatter):
                     continue
 
-                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                name = frontmatter.get("name", skill_dir.name)
+                if not isinstance(name, str):
+                    # YAML scalars like unquoted `name: 2024` parse as int/bool;
+                    # coerce to str so slicing/membership don't TypeError and
+                    # silently drop the skill from the listing.
+                    name = str(name)
+                name = name[:MAX_NAME_LENGTH]
                 if name in seen_names:
                     continue
                 if name in disabled:

@@ -4208,3 +4208,112 @@ class TestRowcountRegressions:
         # exact condition under which the buggy code returned True.
         db.create_session(session_id="s1", source="cli")
         assert db.increment_lineage_version("no_such_session") is False
+
+    # ── insert_compression_lineage: rowcount, not total_changes ──────────
+
+    def test_insert_compression_lineage_first_call_true(self, db):
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(session_id="child", source="cli")
+        ok = db.insert_compression_lineage(
+            child_session_id="child", parent_session_id="parent",
+            strategy="rolling", trigger="manual",
+            tokens_before=1000, tokens_after=500,
+            content_hash="h1", rollback_token="tok-1",
+        )
+        assert ok is True
+
+    def test_insert_compression_lineage_duplicate_child_false(self, db):
+        # child_session_id has a UNIQUE constraint. A second INSERT OR IGNORE
+        # for the same child inserts 0 rows. The prior insert + create_session
+        # calls have already bumped total_changes, so the buggy code that
+        # checked total_changes > 0 wrongly returned True.
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(session_id="child", source="cli")
+        assert db.insert_compression_lineage(
+            child_session_id="child", parent_session_id="parent",
+            strategy="rolling", trigger="manual",
+            tokens_before=1000, tokens_after=500,
+            content_hash="h1", rollback_token="tok-1",
+        ) is True
+        assert db.insert_compression_lineage(
+            child_session_id="child", parent_session_id="parent",
+            strategy="rolling", trigger="manual",
+            tokens_before=1000, tokens_after=500,
+            content_hash="h1", rollback_token="tok-2",
+        ) is False
+
+    # ── consume_rollback_token: lost-race must return None ──────────────
+
+    def test_consume_rollback_token_happy_path(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.save_compression_checkpoint(
+            session_id="s1", trigger="manual",
+            checkpoint_json='{"k":"v"}', rollback_token="rbt-1",
+        )
+        result = db.consume_rollback_token("rbt-1")
+        assert result is not None
+        assert result["session_id"] == "s1"
+        assert result["rollback_token"] == "rbt-1"
+        # Second consume — already consumed, must be None.
+        assert db.consume_rollback_token("rbt-1") is None
+
+    def test_consume_rollback_token_invalid_returns_none(self, db):
+        db.create_session(session_id="s1", source="cli")
+        # A prior write inflates total_changes; buggy code still returned None
+        # for a missing token because the SELECT returns None first — this is
+        # a guard against accidental False-positive on the rowcount fix.
+        assert db.consume_rollback_token("no_such_token") is None
+
+    def test_consume_rollback_token_lost_race_returns_none(self, tmp_path):
+        """Under the lost race, the UPDATE matches 0 rows even though
+        total_changes is already > 0 from the concurrent consumer's write.
+        The rowcount guard must fire and return None; the total_changes
+        guard never did."""
+        import sqlite3 as _sqlite3
+
+        # Build the DB on the real file so we can swap the connection.
+        db_path = tmp_path / "race.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session(session_id="s1", source="cli")
+        db.save_compression_checkpoint(
+            session_id="s1", trigger="manual",
+            checkpoint_json='{"k":"v"}', rollback_token="rbt-1",
+        )
+        # Pre-bump total_changes with an unrelated write so the buggy
+        # `total_changes == 0` guard is clearly non-zero.
+        db.create_session(session_id="s2", source="cli")
+        db.close()
+
+        class _RaceConn(_sqlite3.Connection):
+            _flipped = False
+
+            def execute(self, sql, parameters=()):
+                s = sql.strip().upper()
+                if (
+                    not _RaceConn._flipped
+                    and s.startswith("UPDATE COMPRESSION_CHECKPOINTS SET CONSUMED = 1")
+                    and "CONSUMED = 0" in s
+                ):
+                    # Simulate a concurrent consumer winning the race before
+                    # this UPDATE runs.
+                    super().execute(
+                        "UPDATE compression_checkpoints SET consumed = 1, "
+                        "consumed_at = ? WHERE rollback_token = ? AND consumed = 0",
+                        parameters,
+                    )
+                    _RaceConn._flipped = True
+                return super().execute(sql, parameters)
+
+        race_db = SessionDB(db_path=db_path)
+        race_conn = _sqlite3.connect(
+            str(db_path), factory=_RaceConn, check_same_thread=False,
+        )
+        race_conn.row_factory = _sqlite3.Row
+        race_db._conn.close()
+        race_db._conn = race_conn
+        try:
+            _RaceConn._flipped = False
+            result = race_db.consume_rollback_token("rbt-1")
+            assert result is None
+        finally:
+            race_db.close()

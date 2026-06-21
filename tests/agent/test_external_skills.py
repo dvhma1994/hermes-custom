@@ -139,6 +139,30 @@ class TestExternalSkillsInFindAll:
         assert len(matching) == 1
         assert matching[0]["description"] == "Local version"
 
+    def test_non_string_name_coerced(self, hermes_home):
+        """A skill whose YAML ``name:`` is a non-string scalar (e.g. unquoted
+        ``name: 2024`` parses as int) must be coerced to str, not silently
+        dropped from skills_list().
+
+        Regression: ``frontmatter.get("name")[:MAX_NAME_LENGTH]`` raised
+        TypeError on an int name, the broad ``except Exception`` swallowed it,
+        and the skill vanished from the listing.
+        """
+        local_skills = hermes_home / "skills"
+        numeric = local_skills / "numeric"
+        numeric.mkdir(parents=True)
+        (numeric / "SKILL.md").write_text(
+            "---\nname: 2024\ndescription: numeric-named skill\n---\nbody\n"
+        )
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import _find_all_skills
+            skills = _find_all_skills()
+        names = [s["name"] for s in skills]
+        assert "2024" in names
+
 
 class TestExternalSkillView:
     def test_skill_view_finds_external(self, hermes_home, external_skills_dir):

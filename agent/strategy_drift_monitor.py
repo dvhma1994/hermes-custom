@@ -89,9 +89,22 @@ class StrategyDriftMonitor:
         return snapshot
 
     def is_drift_alert(self, strategy_id: str, now: Optional[float] = None) -> bool:
-        """True if the most recent drift snapshot exceeds threshold."""
-        snapshot = self.snapshot(strategy_id, now)
-        return snapshot.drift_pct > snapshot.threshold_pct
+        """True if the strategy's current win_rate has drifted beyond threshold.
+
+        READ-ONLY: this no longer records a snapshot. ``_baseline_win_rate`` is
+        the AVG over recorded snapshots, and ``snapshot()`` inserts one with the
+        CURRENT win_rate — so polling drift via snapshot() on every call dragged
+        the baseline toward the current value and self-extinguished a real
+        sustained drift (a 0.9→0.4 shift faded to ~0 just from being polled).
+        Compute drift against the existing baseline without mutating it; call
+        ``snapshot()`` explicitly to record a new baseline sample.
+        """
+        current = self._effectiveness.evaluate(strategy_id)
+        baseline = self._baseline_win_rate(strategy_id)
+        if baseline is None:
+            return False
+        drift_pct = abs(current.win_rate - baseline)
+        return drift_pct > lc.LEARNING_PROMOTION_MAX_DRIFT_PERCENT
 
     def recent_snapshots(self, strategy_id: str, limit: int = 10) -> List[DriftSnapshot]:
         cur = self._conn.execute(

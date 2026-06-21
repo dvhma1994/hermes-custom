@@ -128,17 +128,21 @@ def _render_mentions(text: str, mentions: list) -> str:
     """
     if not mentions or "\uFFFC" not in text:
         return text
-    # Sort mentions by start position (reverse) to replace from end to start
-    # so indices don't shift as we replace
+    # Signal BodyRange start/length are measured in **UTF-16 code units** (the
+    # same convention _markdown_to_signal uses outbound), NOT Python codepoints.
+    # Slicing the str directly mis-locates the mention whenever an astral char
+    # (emoji, CJK Ext-B, \u2026) precedes it \u2014 1 codepoint but 2 UTF-16 units \u2014 leaving
+    # the \uFFFC placeholder in place and consuming the wrong characters. Operate
+    # on the UTF-16-LE byte view (2 bytes per code unit) so offsets line up.
+    units = bytearray(text.encode("utf-16-le"))
     sorted_mentions = sorted(mentions, key=lambda m: m.get("start", 0), reverse=True)
     for mention in sorted_mentions:
         start = mention.get("start", 0)
         length = mention.get("length", 1)
-        # Use the mention's number or UUID as the replacement
         identifier = mention.get("number") or mention.get("uuid") or "user"
-        replacement = f"@{identifier}"
-        text = text[:start] + replacement + text[start + length:]
-    return text
+        replacement = f"@{identifier}".encode("utf-16-le")
+        units[start * 2:(start + length) * 2] = replacement
+    return bytes(units).decode("utf-16-le")
 
 
 def _is_signal_service_id(value: str) -> bool:
@@ -230,6 +234,15 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Normalize account for self-message filtering
         self._account_normalized = self.account.strip()
+
+        # The bot's own Signal service ID (ACI/PNI UUID). Modern Signal
+        # group @mentions carry the recipient's UUID (not the phone number),
+        # so require_mention can only match them when the adapter knows its
+        # own UUID. Sourced from config extra (account_uuid /
+        # account_service_id); when only the phone is configured the mention
+        # filter falls back to phone-number matching (pre-existing behavior).
+        _acct_sid = (extra.get("account_uuid") or extra.get("account_service_id") or "").strip()
+        self._account_service_id = _acct_sid if _is_signal_service_id(_acct_sid) else ""
 
         # Track recently sent message timestamps to prevent echo-back loops
         # in Note to Self / self-chat mode (mirrors WhatsApp recentlySentIds)
@@ -529,12 +542,17 @@ class SignalAdapter(BasePlatformAdapter):
         # Mention filter: in groups, only process messages that @mention the bot account
         if is_group and self.require_mention:
             account_norm = self._account_normalized
-            # Check rendered mention tags OR raw mention metadata
-            mentioned_in_text = account_norm and (
-                f"@{account_norm}" in (text or "")
-            )
+            account_sid = self._account_service_id
+            # A mention may target the bot by phone OR by its service UUID.
+            # Signal commonly omits the phone from mention metadata and only
+            # sends the UUID, so match either identifier in both the rendered
+            # text and the raw mention metadata.
+            self_tokens = tuple(tok for tok in (account_norm, account_sid) if tok)
+            haystack = text or ""
+            mentioned_in_text = any(f"@{tok}" in haystack for tok in self_tokens)
             mentioned_in_metadata = any(
-                m.get("number") == account_norm or m.get("uuid") == account_norm
+                (account_norm and (m.get("number") == account_norm or m.get("uuid") == account_norm))
+                or (account_sid and (m.get("uuid") == account_sid or m.get("number") == account_sid))
                 for m in (data_message.get("mentions") or [])
             )
             if not mentioned_in_text and not mentioned_in_metadata:

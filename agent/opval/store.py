@@ -497,10 +497,17 @@ class OpvalStore:
     ) -> Dict[str, Any]:
         """Rolling turn stats restricted to eligible sessions."""
         params: List[Any] = [window_start, window_end, window_start]
+        # Distinguish None (no caller-supplied restriction → all in-window) from
+        # an EMPTY set (an explicit "zero eligible sessions" → match nothing).
+        # Treating the empty set as falsy left sid_filter='1=1' and aggregated
+        # drift/misalignment/eligible_turns over EVERY non-synthetic session.
         sid_filter = "1=1"
-        if eligible_session_ids:
-            sid_filter = "t.session_id IN ({})".format(",".join("?" * len(eligible_session_ids)))
-            params.extend(sorted(eligible_session_ids))
+        if eligible_session_ids is not None:
+            if eligible_session_ids:
+                sid_filter = "t.session_id IN ({})".format(",".join("?" * len(eligible_session_ids)))
+                params.extend(sorted(eligible_session_ids))
+            else:
+                sid_filter = "0=1"
         cur = self._conn.execute(
             f"""
             SELECT
@@ -529,11 +536,16 @@ class OpvalStore:
         window_end: float,
         eligible_session_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
+        # See get_rolling_turn_stats: empty set means "zero eligible" (match
+        # nothing), only None means "no restriction".
         sid_filter = "1=1"
         params: List[Any] = [window_start, window_end]
-        if eligible_session_ids:
-            sid_filter = "session_id IN ({})".format(",".join("?" * len(eligible_session_ids)))
-            params.extend(sorted(eligible_session_ids))
+        if eligible_session_ids is not None:
+            if eligible_session_ids:
+                sid_filter = "session_id IN ({})".format(",".join("?" * len(eligible_session_ids)))
+                params.extend(sorted(eligible_session_ids))
+            else:
+                sid_filter = "0=1"
         cur = self._conn.execute(
             f"""
             SELECT * FROM opval_sessions

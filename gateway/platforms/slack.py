@@ -1612,6 +1612,12 @@ class SlackAdapter(BasePlatformAdapter):
             url = m.group(2).strip()
             if url.startswith("<") and url.endswith(">"):
                 url = url[1:-1].strip()
+            # Escape Slack control chars in the LABEL here: the entity is stashed
+            # behind a placeholder that bypasses the step-6 escaping pass, so a
+            # raw '<'/'>'/'&' in the label would break the <url|label> entity
+            # (e.g. a bare '>' prematurely closes the link). '&' first so the
+            # subsequent <,> replacements don't double-escape it.
+            label = label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             return _ph(f"<{url}|{label}>")
 
         text = re.sub(

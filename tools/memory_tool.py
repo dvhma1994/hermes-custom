@@ -59,6 +59,22 @@ def get_memory_dir() -> Path:
 ENTRY_DELIMITER = "\n§\n"
 
 
+def _reject_entry_delimiter(content: str) -> Optional[str]:
+    """Return an error message if *content* contains the entry delimiter.
+
+    Memory entries are persisted ENTRY_DELIMITER-joined and split back on read.
+    A literal delimiter inside one entry's content silently fractures it into
+    multiple entries on the next reload — and the external-drift guard can't
+    catch it (the parsed/round-tripped bytes match). Reject it at write time.
+    """
+    if ENTRY_DELIMITER in content:
+        return (
+            "Content cannot contain the entry delimiter (a lone '§' on its "
+            "own line). Rephrase to avoid that exact line."
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
 # in content that gets injected into the system prompt.
@@ -262,10 +278,17 @@ class MemoryStore:
         """
         path = self._path_for(target)
         bak = self._detect_external_drift(target)
+        if bak:
+            # Drift detected: the caller (add/replace/remove) will abort the
+            # mutation without saving. Do NOT overwrite live in-memory state with
+            # the un-roundtrippable on-disk content — leave the session's entries
+            # exactly as they were, so the live state doesn't silently diverge
+            # from both the prior state and what the tool intended.
+            return bak
         fresh = self._read_file(path)
         fresh = list(dict.fromkeys(fresh))  # deduplicate
         self._set_entries(target, fresh)
-        return bak
+        return None
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
@@ -299,6 +322,15 @@ class MemoryStore:
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
+
+        # Reject the entry delimiter inside content: entries are stored
+        # ENTRY_DELIMITER-joined and split back on read, so a literal "\n§\n"
+        # in one entry would silently fracture it into several on the next
+        # reload (data corruption the drift guard can't detect — both sides
+        # round-trip identically). See _reject_entry_delimiter.
+        delim_error = _reject_entry_delimiter(content)
+        if delim_error:
+            return {"success": False, "error": delim_error}
 
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
@@ -354,6 +386,12 @@ class MemoryStore:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
+
+        # Reject the entry delimiter (see add): a literal "\n§\n" would fracture
+        # the entry into several on the next reload.
+        delim_error = _reject_entry_delimiter(new_content)
+        if delim_error:
+            return {"success": False, "error": delim_error}
 
         # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)
@@ -565,9 +603,16 @@ class MemoryStore:
 
         # Drift confirmed — snapshot the file so the operator can recover
         # whatever the external writer added, then return the .bak path so
-        # the caller can refuse the mutation.
+        # the caller can refuse the mutation. Two drifts can land in the
+        # same epoch second; a bare `.bak.<ts>` would let the second
+        # write_text() clobber the first snapshot. Append a counter until
+        # the path is free so every snapshot is preserved (#26045).
         ts = int(time.time())
         bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
+        counter = 1
+        while bak_path.exists():
+            bak_path = path.with_suffix(path.suffix + f".bak.{ts}.{counter}")
+            counter += 1
         try:
             bak_path.write_text(raw, encoding="utf-8")
         except (OSError, IOError):

@@ -1940,3 +1940,111 @@ class TestSignalContentlessEnvelope:
 
         assert "event" in captured, "Normal message should NOT be skipped"
         assert captured["event"].text == "hello world"
+
+
+class TestSignalGroupRequireMentionUuid:
+    """Group require_mention must match a UUID-based @mention of the bot.
+
+    Modern Signal mention metadata carries the recipient's service UUID, not
+    the phone number. The bot's account_norm is its phone, so the old
+    `m.get('uuid') == account_norm` was always False and legit mentions were
+    dropped. With account_uuid configured, the UUID mention must match.
+    """
+
+    @pytest.mark.asyncio
+    async def test_uuid_mention_processed_when_account_uuid_configured(self, monkeypatch):
+        bot_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="+155****4567",
+            group_allowed="*",
+            require_mention=True,
+            account_uuid=bot_uuid,
+        )
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "+155****9999",
+                "sourceUuid": "05668cf3-8ffa-467e-9b24-f5eefa5cf475",
+                "sourceName": "Member",
+                "timestamp": 1777600696077,
+                "dataMessage": {
+                    "message": "\uFFFC hello bot",
+                    "mentions": [{"start": 0, "length": 1, "uuid": bot_uuid}],
+                    "groupInfo": {"groupId": "grp-test=="},
+                },
+            }
+        })
+
+        assert "event" in captured, "UUID @mention of bot must be processed, not dropped"
+
+    @pytest.mark.asyncio
+    async def test_mention_of_other_user_still_dropped(self, monkeypatch):
+        bot_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="+155****4567",
+            group_allowed="*",
+            require_mention=True,
+            account_uuid=bot_uuid,
+        )
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "+155****9999",
+                "sourceUuid": "05668cf3-8ffa-467e-9b24-f5eefa5cf475",
+                "sourceName": "Member",
+                "timestamp": 1777600696077,
+                "dataMessage": {
+                    "message": "\uFFFC hello",
+                    "mentions": [{"start": 0, "length": 1, "uuid": "deadbeef-0000-0000-0000-000000000000"}],
+                    "groupInfo": {"groupId": "grp-test=="},
+                },
+            }
+        })
+
+        assert "event" not in captured, "Mention of another user must still be dropped"
+
+    @pytest.mark.asyncio
+    async def test_phone_mention_still_matches_without_uuid(self, monkeypatch):
+        """Phone-only config (no account_uuid) preserves pre-existing behavior."""
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="+155****4567",
+            group_allowed="*",
+            require_mention=True,
+        )
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "+155****9999",
+                "sourceUuid": "05668cf3-8ffa-467e-9b24-f5eefa5cf475",
+                "sourceName": "Member",
+                "timestamp": 1777600696077,
+                "dataMessage": {
+                    "message": "\uFFFC hello",
+                    "mentions": [{"start": 0, "length": 1, "number": "+155****4567"}],
+                    "groupInfo": {"groupId": "grp-test=="},
+                },
+            }
+        })
+
+        assert "event" in captured, "Phone @mention must match under phone-only config"

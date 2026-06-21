@@ -104,11 +104,20 @@ class StrategyEffectivenessManager:
                     ) if v is not None
                 ]
                 score = (sum(_parts) / len(_parts) * 100.0) if _parts else 0.0
-            # Alignment derived from 1 - misalignment, clamped
-            alignment = max(0.0, 1.0 - float(misalignment_pct)) * 100.0
+            # drift_pct / misalignment_pct come from the collector on a 0-100
+            # PERCENT scale (agent/opval/collectors.py: (n/total)*100). Align the
+            # units to their thresholds:
+            #   - avg_alignment is compared to EFFECTIVENESS_AVG_ALIGNMENT_THRESHOLD
+            #     = 65.0 (a 0-100 percentage), so alignment = 100 - misalignment_pct.
+            #     The old `(1.0 - misalignment_pct) * 100` treated the percent as a
+            #     fraction and collapsed alignment to 0 for ANY misaligned turn.
+            #   - avg_drift is compared to LEARNING_PROMOTION_MAX_DRIFT_PERCENT =
+            #     0.15 (a 0-1 fraction), so convert drift_pct -> fraction. The old
+            #     raw 0-100 value was ~100x inflated, making promotion impossible.
+            alignment = max(0.0, 100.0 - float(misalignment_pct))
             scores.append(score)
             alignments.append(alignment)
-            drifts.append(float(drift_pct))
+            drifts.append(float(drift_pct) / 100.0)
 
         return {
             "sample_count": total,

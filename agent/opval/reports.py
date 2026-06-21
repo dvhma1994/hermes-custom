@@ -62,8 +62,16 @@ class MonthlyReportGenerator:
             dt = _dt.utcfromtimestamp(now)
             year, month = dt.year, dt.month
             _, end_day = calendar.monthrange(year, month)
-            period_start = _datetime.datetime(year, month, 1, 0, 0, 0).timestamp()
-            period_end = _datetime.datetime(year, month, end_day, 23, 59, 59).timestamp()
+            # Build the month boundaries in UTC. ``year``/``month`` come from
+            # ``utcfromtimestamp`` (UTC), so a naive ``datetime(...).timestamp()``
+            # would interpret them as LOCAL time and shift the boundaries by the
+            # host's UTC offset — selecting the wrong sessions near a boundary.
+            period_start = _datetime.datetime(
+                year, month, 1, 0, 0, 0, tzinfo=_datetime.timezone.utc
+            ).timestamp()
+            period_end = _datetime.datetime(
+                year, month, end_day, 23, 59, 59, tzinfo=_datetime.timezone.utc
+            ).timestamp()
 
         readiness = self._readiness.compute(window_days=30)
         health = EvidenceHealthReport(self._store).generate(window_days=30)

@@ -752,9 +752,16 @@ def _parse_iso_timestamp(value: Any) -> Optional[float]:
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(text).timestamp()
+        parsed = datetime.fromisoformat(text)
     except Exception:
         return None
+    # Naive ISO (no offset) is a UTC wall-clock, not host-local time. Without
+    # this guard, pool-entry expiry ordering is shifted by the host UTC offset
+    # and _select_nous_pool_entry can pick the wrong (earlier-expiring) entry.
+    # Matches hermes_cli/auth.py:_parse_iso_timestamp and tools/skill_usage.py.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _coerce_str(value: Any) -> Optional[str]:

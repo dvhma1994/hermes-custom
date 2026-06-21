@@ -347,8 +347,12 @@ class WhatsAppBehaviorMixin:
         # which WhatsApp renders with literal asterisks).
         def _header_to_bold(m: re.Match) -> str:
             inner = m.group(1).strip()
-            while len(inner) > 1 and inner.startswith("*") and inner.endswith("*"):
-                inner = inner[1:-1].strip()
+            # The whole header becomes a single WhatsApp bold span (*text*).
+            # Strip any inner asterisks — already-emphasized fragments carried
+            # over from step 3 (e.g. "# *Summary* of results") or unbalanced
+            # markers — so we never emit a "**" pair, which WhatsApp renders as
+            # a literal pair of asterisks.
+            inner = inner.replace("*", "").strip()
             return f"*{inner}*"
 
         result = re.sub(

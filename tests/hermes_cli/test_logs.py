@@ -240,6 +240,58 @@ class TestReadTail:
         result = _read_last_n_lines(log_file, 10)
         assert result == []
 
+    def test_zero_lines_returns_empty(self, tmp_path):
+        """``lines=0`` must return [], not the whole file.
+
+        Regression: ``all_lines[-n:]`` with n==0 is ``all_lines[-0:]`` ==
+        ``all_lines[0:]`` == the entire file, so ``GET /api/logs?lines=0``
+        returned the whole log instead of nothing.
+        """
+        log_file = tmp_path / "test.log"
+        log_file.write_text("a\nb\nc\nd\ne\n")
+        assert _read_last_n_lines(log_file, 0) == []
+        # negatives clamp to empty too
+        assert _read_last_n_lines(log_file, -3) == []
+
+    def test_positive_n_unaffected_by_zero_guard(self, tmp_path):
+        """Companion: the n<=0 guard must not change positive-n behaviour."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("a\nb\nc\nd\ne\n")
+        result = _read_last_n_lines(log_file, 3)
+        assert len(result) == 3
+        assert result[-1] == "e\n"
+
+    def test_read_tail_zero_lines_with_filters_returns_empty(self, tmp_path):
+        """``_read_tail`` with filters and num_lines==0 must return [], not the
+        whole filtered set.
+
+        Regression: the filtered branch did ``filtered[-num_lines:]`` and
+        ``filtered[-0:]`` == ``filtered[0:]`` == the entire filtered list, so
+        ``GET /api/logs?lines=0&level=ERROR`` returned the whole matching log.
+        Mirrors the same ``-0:`` trap fixed in ``_read_last_n_lines``.
+        """
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            "2026-01-01 00:00:00 ERROR gateway.run: boom\n"
+            "2026-01-01 00:00:01 INFO tools.file: ok\n"
+            "2026-01-01 00:00:02 ERROR gateway.run: boom2\n"
+        )
+        assert _read_tail(log_file, 0, has_filters=True, min_level="ERROR") == []
+        # negative clamps to empty too
+        assert _read_tail(log_file, -2, has_filters=True, min_level="ERROR") == []
+
+    def test_read_tail_positive_n_with_filters_unaffected(self, tmp_path):
+        """Companion: the num_lines<=0 guard must not change filtered reads."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            "2026-01-01 00:00:00 ERROR gateway.run: boom\n"
+            "2026-01-01 00:00:01 INFO tools.file: ok\n"
+            "2026-01-01 00:00:02 ERROR gateway.run: boom2\n"
+        )
+        result = _read_tail(log_file, 1, has_filters=True, min_level="ERROR")
+        assert len(result) == 1
+        assert "boom2" in result[0]
+
 
 # ---------------------------------------------------------------------------
 # LOG_FILES registry

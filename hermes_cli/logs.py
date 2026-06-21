@@ -264,6 +264,11 @@ def _read_tail(
 
     When filters are active, we read more raw lines to find enough matches.
     """
+    # num_lines <= 0 means "no lines". `filtered[-num_lines:]` with
+    # num_lines==0 is `filtered[-0:]` == the whole filtered list, so
+    # short-circuit here too (mirrors the guard in _read_last_n_lines).
+    if num_lines <= 0:
+        return []
     if has_filters:
         # Read more lines to ensure we get enough after filtering.
         # For large files, read last 10K lines and filter down.
@@ -285,6 +290,10 @@ def _read_last_n_lines(path: Path, n: int) -> list:
     For files under 1MB, reads the whole file (fast, simple).
     For larger files, reads chunks from the end.
     """
+    # n <= 0 means "no lines". `all_lines[-0:]` would silently return the
+    # whole file (since [-0:] == [0:]), so short-circuit to an empty list.
+    if n <= 0:
+        return []
     try:
         size = path.stat().st_size
         if size == 0:

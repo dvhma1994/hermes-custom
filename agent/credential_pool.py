@@ -279,9 +279,17 @@ def _parse_absolute_timestamp(value: Any) -> Optional[float]:
         if numeric is not None:
             return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             return None
+        # A naive ISO timestamp (no offset) is a UTC wall-clock from the
+        # provider, NOT host-local time. Treating it as local shifts the
+        # exhaustion cooldown by the host's UTC offset (re-entering rotation
+        # early on UTC+N hosts). Matches the canonical sibling parsers in
+        # hermes_cli/auth.py and tools/skill_usage.py.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
     return None
 
 

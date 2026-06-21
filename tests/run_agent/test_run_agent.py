@@ -756,6 +756,32 @@ class TestMaskApiKey:
         assert "..." in result
 
 
+class TestSummarizeApiError:
+    """_summarize_api_error must not crash when error.message is non-string.
+
+    A malformed provider body can put an int/dict/list in error.message; the
+    old `msg[:300]` raised TypeError and masked the real provider error inside
+    the error-handling path itself. The fix coerces to str before slicing.
+    """
+
+    def test_int_message_does_not_raise(self):
+        # OLD: msg[:300] on int 500 → TypeError. NEW: coerced to "500".
+        err = SimpleNamespace(status_code=500, body={"error": {"message": 500}})
+        result = AIAgent._summarize_api_error(err)
+        assert "500" in result
+        assert "HTTP 500" in result
+
+    def test_dict_message_does_not_raise(self):
+        err = SimpleNamespace(status_code=502, body={"error": {"message": {"detail": "x"}}})
+        result = AIAgent._summarize_api_error(err)
+        assert "502" in result  # str(dict) coerced, no TypeError
+
+    def test_string_message_still_summarized(self):
+        err = SimpleNamespace(status_code=429, body={"error": {"message": "rate limited"}})
+        result = AIAgent._summarize_api_error(err)
+        assert "rate limited" in result
+
+
 # ===================================================================
 # Group 2: State / Structure Methods
 # ===================================================================

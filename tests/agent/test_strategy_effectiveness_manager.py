@@ -120,10 +120,13 @@ def test_effectiveness_avg_score_threshold(tmp_path):
 
 def test_effectiveness_avg_alignment_threshold(tmp_path):
     store = _make_store(tmp_path)
+    # misalignment_pct is on the production 0-100 PERCENT scale (collectors store
+    # (misaligned/total)*100). 40% misaligned -> avg_alignment 60 (< the 65 gate).
     for _ in range(3):
-        _obs_for_session(store, str(uuid.uuid4()), outcome="success", misalignment=0.5)
+        _obs_for_session(store, str(uuid.uuid4()), outcome="success", misalignment=40.0)
     sem = StrategyEffectivenessManager(store._conn)
     result = sem.evaluate("strategy:coding")
+    assert result.avg_alignment == pytest.approx(60.0, abs=0.01)
     assert result.avg_alignment < lc.EFFECTIVENESS_AVG_ALIGNMENT_THRESHOLD
     assert not result.promotion_eligible
 

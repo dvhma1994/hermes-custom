@@ -1041,13 +1041,18 @@ def remove_job(job_id: str) -> bool:
         original_len = len(jobs)
         jobs = [j for j in jobs if j["id"] != canonical_id]
         if len(jobs) < original_len:
-            # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
-            # left over from before the create-time guard) fails closed without
-            # half-applying the removal.
-            job_output_dir = _job_output_dir(canonical_id)
+            # Persist the removal first. A legacy unsafe ID (containing ".."
+            # or path separators, left over from before the create-time guard)
+            # can't be mapped to a sandboxed output dir — but the job record
+            # must still leave storage, so guard the dir cleanup instead of
+            # letting it abort the removal and leave the record behind forever.
             save_jobs(jobs)
+            try:
+                job_output_dir = _job_output_dir(canonical_id)
+            except ValueError:
+                job_output_dir = None
             # Clean up output directory to prevent orphaned dirs accumulating
-            if job_output_dir.exists():
+            if job_output_dir is not None and job_output_dir.exists():
                 shutil.rmtree(job_output_dir)
             return True
     return False
@@ -1265,7 +1270,10 @@ def save_job_output(job_id: str, output: str):
     _secure_dir(job_output_dir)
     
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
+    # Append a unique suffix so two runs in the same wall-clock second don't
+    # overwrite each other. Read-back sorts by mtime (newest wins), so the
+    # suffix doesn't affect which file is picked as the latest run.
+    output_file = job_output_dir / f"{timestamp}_{uuid.uuid4().hex[:8]}.md"
     
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:

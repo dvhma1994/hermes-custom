@@ -156,6 +156,27 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+
+def _is_silent_directive(content: str) -> bool:
+    """True if a cron agent response is the [SILENT] delivery-suppression marker.
+
+    The marker suppresses delivery when the agent uses it AS A DIRECTIVE, which
+    per the cron hint means either the whole response is the marker, the response
+    LEADS with it (e.g. "[SILENT] no changes"), or the marker stands ALONE on a
+    line (e.g. an explanation followed by a trailing "\\n[SILENT]").
+
+    It must NOT fire when the token merely appears mid-sentence inside a genuine
+    report (e.g. "phone is in [silent] mode" or "notifications set to [SILENT].").
+    The previous case-insensitive SUBSTRING test silently dropped those reports.
+    """
+    if not content:
+        return False
+    stripped = content.strip()
+    upper = stripped.upper()
+    if upper.startswith(SILENT_MARKER):
+        return True
+    return any(line.strip().upper() == SILENT_MARKER for line in stripped.splitlines())
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -829,9 +850,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
                 # fresh thread that has no running loop.
                 coro.close()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
-                    result = future.result(timeout=30)
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        result = future.result(timeout=30)
+                except Exception as e:
+                    # A failure here (timeout, send error) is NOT caught by the
+                    # sibling `except Exception` below — sibling handlers never
+                    # catch exceptions raised inside another handler — so it would
+                    # escape the loop and abort delivery to every REMAINING
+                    # target. Record it and continue, like the standalone path.
+                    msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                    continue
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg)
@@ -889,7 +921,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, cwd: Optional[str] = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -974,7 +1006,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
+            # Run in the caller-supplied workdir when provided (no_agent job
+            # `workdir`), else the script's own directory. Passing cwd to the
+            # subprocess avoids mutating the shared process-global cwd.
+            cwd=cwd or str(path.parent),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -1339,25 +1374,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             return False, "", "", err
 
         # Apply workdir if configured — lets scripts use predictable relative
-        # paths. For no_agent jobs this is just the subprocess cwd (not an
-        # agent TERMINAL_CWD bridge).
+        # paths. Pass it as the SUBPROCESS cwd rather than os.chdir(): the global
+        # process cwd is shared with other cron jobs running concurrently in the
+        # parallel pool, so chdir'ing here corrupted their relative-path
+        # resolution (and was ineffective anyway — _run_job_script already sets
+        # the subprocess cwd explicitly).
         _job_workdir = (job.get("workdir") or "").strip() or None
-        _prior_cwd = None
-        if _job_workdir and Path(_job_workdir).is_dir():
-            _prior_cwd = os.getcwd()
-            try:
-                os.chdir(_job_workdir)
-            except OSError:
-                _prior_cwd = None
+        if _job_workdir and not Path(_job_workdir).is_dir():
+            _job_workdir = None
 
-        try:
-            ok, output = _run_job_script(script_path)
-        finally:
-            if _prior_cwd is not None:
-                try:
-                    os.chdir(_prior_cwd)
-                except OSError:
-                    pass
+        ok, output = _run_job_script(script_path, cwd=_job_workdir)
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2061,7 +2087,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.
                 should_deliver = bool(deliver_content.strip())
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+                if should_deliver and success and _is_silent_directive(deliver_content):
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
 
@@ -2120,7 +2146,17 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
 
-            return pool.submit(_run_and_release)
+            try:
+                return pool.submit(_run_and_release)
+            except BaseException:
+                # submit() failed (e.g. pool shutting down / queue full): the
+                # worker — and thus its finally that discards the id — never
+                # runs, so release the in-flight guard here. Otherwise the id
+                # stays in _running_job_ids and the job is skipped on EVERY
+                # future tick ("already running") and never fires again.
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                raise
 
         # Sequential pass for env-mutating (workdir) jobs.
         # Queued to a persistent single-thread pool so they run one at a time

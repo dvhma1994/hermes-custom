@@ -210,7 +210,10 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
                 
                 # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
                 # (used when native thinking is disabled and model reasons via XML)
-                raw_content = msg["content"] or ""
+                # .get(): a reasoning-only / content-stripped assistant turn may
+                # omit the 'content' key entirely — indexing it raised KeyError
+                # and aborted the trajectory save (matches the tool_calls branch).
+                raw_content = msg.get("content") or ""
                 content += convert_scratchpad_to_think(raw_content)
                 
                 # Ensure every gpt turn has a <think> block (empty if no reasoning)
@@ -225,7 +228,7 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
         elif msg["role"] == "user":
             trajectory.append({
                 "from": "human",
-                "value": msg["content"]
+                "value": msg.get("content") or ""
             })
         
         i += 1
@@ -390,11 +393,24 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             continue
         role = msg.get("role")
         if role == "assistant":
-            known_tool_ids = set()
-            for tc in (msg.get("tool_calls") or []):
-                tc_id = tc.get("id") if isinstance(tc, dict) else None
-                if tc_id:
-                    known_tool_ids.add(tc_id)
+            tcs = msg.get("tool_calls") or []
+            if tcs:
+                # ACCUMULATE ids across consecutive assistant(tool_calls) turns
+                # rather than resetting on every assistant: when two such turns
+                # are back-to-back, a tool result for the FIRST turn validly
+                # arrives after the SECOND, and a per-assistant reset dropped it
+                # as a bogus orphan. Tool-call ids are unique, so a result is an
+                # orphan iff its id was never issued in this run — accumulation
+                # keeps that check correct while fixing the back-to-back case.
+                for tc in tcs:
+                    # Match the canonical extractor AIAgent._get_tool_call_id_static:
+                    # call_id OR id (Codex/Responses-shape carry only call_id).
+                    tc_id = (tc.get("call_id") or tc.get("id")) if isinstance(tc, dict) else None
+                    if tc_id:
+                        known_tool_ids.add(tc_id)
+            else:
+                # A plain (no-tool_calls) assistant reply closes the tool run.
+                known_tool_ids = set()
             filtered.append(msg)
         elif role == "tool":
             tc_id = msg.get("tool_call_id")
@@ -2435,10 +2451,16 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                 context["reset_at"] = time.time() + seconds
             else:
                 resets_in_match = re.search(
+                    # NOTE: use a "not followed by a letter" lookahead, not \b,
+                    # after each unit. \b between a unit letter and a digit
+                    # (e.g. "2h30m": 'h'->'3', both word chars) is absent, so \b
+                    # made compact multi-unit durations fail to parse. The
+                    # lookahead still rejects 'h' inside 'hours' (followed by a
+                    # letter) while accepting 'h' before a digit/space/end.
                     r"resets?\s+in\s+"
-                    r"(?:(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b\s*)?"
-                    r"(?:(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b\s*)?"
-                    r"(?:(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b)?",
+                    r"(?:(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)(?![a-zA-Z])\s*)?"
+                    r"(?:(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)(?![a-zA-Z])\s*)?"
+                    r"(?:(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)(?![a-zA-Z]))?",
                     message,
                     re.IGNORECASE,
                 )

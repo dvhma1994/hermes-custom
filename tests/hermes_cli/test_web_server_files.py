@@ -141,6 +141,38 @@ def test_directory_management_requires_recursive_delete_for_nonempty_dirs(forced
     assert not runs_path.exists()
 
 
+def test_listing_tolerates_unstable_child(forced_files_client, monkeypatch):
+    """A single un-stat-able child (dangling symlink / ACL-restricted) makes
+    _managed_file_entry raise HTTPException(500). list_managed_files must
+    skip it so the whole GET /api/files still returns 200 with the rest of the
+    children — matches /api/fs/list which tolerates such entries."""
+    from fastapi import HTTPException
+
+    client, root = forced_files_client
+    folder = root / "mixed"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "good.txt").write_text("ok")
+    bad = folder / "unstable"
+    bad.write_text("can't stat me")
+
+    real_entry = web_server._managed_file_entry
+
+    def flaky_entry(policy, target):
+        if target.name == "unstable":
+            # Simulate the un-stat-able child: .stat() raised OSError -> 500.
+            raise HTTPException(status_code=500, detail="Could not stat path")
+        return real_entry(policy, target)
+
+    monkeypatch.setattr(web_server, "_managed_file_entry", flaky_entry)
+
+    listing = client.get("/api/files", params={"path": str(folder)})
+    assert listing.status_code == 200, listing.text
+    names = {entry["name"] for entry in listing.json()["entries"]}
+    # The healthy child is still listed; the un-stat-able child is skipped.
+    assert "good.txt" in names
+    assert "unstable" not in names
+
+
 def test_forced_root_paths_stay_under_root(forced_files_client, tmp_path):
     client, root = forced_files_client
     outside = tmp_path / "outside"

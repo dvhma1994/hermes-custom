@@ -103,6 +103,25 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _running_tool_names(not_done, futures, runnable_calls):
+    """Tool names for the futures still running (for the heartbeat message).
+
+    ``futures`` is built ONLY from ``runnable_calls`` (blocked calls are
+    excluded), so a future's position must be mapped back through
+    ``runnable_calls`` — NOT ``parsed_calls``, which still contains the blocked
+    calls. Indexing ``parsed_calls`` by the future position shifts every name by
+    the number of earlier blocked calls, so the heartbeat reports the wrong
+    tools (and can even name a blocked tool that never ran).
+
+    Each ``runnable_calls`` entry is ``(orig_index, tool_call, name, args)``.
+    """
+    names = []
+    for f in not_done:
+        if f in futures:
+            names.append(runnable_calls[futures.index(f)][2])
+    return names
+
+
 def _record_tool_outcome_safe(agent, function_name: str, is_error: bool) -> None:
     """Milestone 1: record a tool outcome to RuntimeFeedback if available.
 
@@ -249,17 +268,36 @@ def _run_agent_tool_execution_middleware(
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
-    result = run_tool_execution_middleware(
-        function_name,
-        function_args,
-        _execute,
-        original_args=function_args,
-        task_id=effective_task_id or "",
-        session_id=getattr(agent, "session_id", "") or "",
-        tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-    )
+    try:
+        result = run_tool_execution_middleware(
+            function_name,
+            function_args,
+            _execute,
+            original_args=function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
+    except Exception as tool_error:
+        # A raising inline tool (todo/session_search/memory/clarify/
+        # read_terminal/delegate_task) or its execution middleware must NOT
+        # abort the entire turn — several of those branches lacked an
+        # except-handler, so the exception escaped to the conversation loop and
+        # killed the turn. Convert it to an error tool-result here (centralized)
+        # so the single tool fails and the turn continues, matching the
+        # context-engine/memory-manager branches. Only Exception is caught:
+        # KeyboardInterrupt/BaseException still propagate so user-interrupt and
+        # cancellation semantics are preserved.
+        logger.error(
+            "inline tool %r raised during execution: %s",
+            function_name, tool_error, exc_info=True,
+        )
+        return (
+            json.dumps({"error": f"Tool '{function_name}' failed: {tool_error}"}),
+            observed_args,
+        )
     return result, observed_args
 
 
@@ -540,7 +578,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
-                results[index] = (function_name, function_args, result, duration, True, False, middleware_trace)
+                # A user/keyboard cancellation is NOT a tool failure: is_error
+                # must be False so it isn't fed to RuntimeFeedback as a failure,
+                # isn't recorded as a failed file mutation, and doesn't surface as
+                # is_error in the progress feed. Keep blocked=False so the
+                # downstream tool.completed event still fires and closes the
+                # progress entry (tool.started was already emitted pre-submit).
+                results[index] = (function_name, function_args, result, duration, False, False, middleware_trace)
                 return
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
@@ -629,11 +673,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     _conc_elapsed = int(time.time() - _conc_start)
                     # Heartbeat every ~30s (6 × 5s poll intervals)
                     if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
-                        _still_running = [
-                            parsed_calls[futures.index(f)][1]
-                            for f in not_done
-                            if f in futures
-                        ]
+                        _still_running = _running_tool_names(not_done, futures, runnable_calls)
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
                             f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
@@ -680,6 +720,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             tool_duration = 0.0
+            # Close the progress entry: tool.started was already emitted for
+            # every call in the pre-submit loop, but a tool cancelled before its
+            # worker stored a result (r is None) never fired tool.completed,
+            # leaking a perpetually-"running" entry in the progress feed. Emit it
+            # now (is_error=False — a cancellation is not a failure).
+            if agent.tool_progress_callback:
+                try:
+                    agent.tool_progress_callback(
+                        "tool.completed", name, None, None,
+                        duration=0.0, is_error=False, result=function_result,
+                    )
+                except Exception as cb_err:
+                    logging.debug(f"Tool progress callback error (cancelled): {cb_err}")
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
 
@@ -806,13 +859,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {len(remaining_calls)} tool call(s)", force=True)
             for skipped_tc in remaining_calls:
                 skipped_name = skipped_tc.function.name
-                skip_msg = {
-                    "role": "tool",
-                    "name": skipped_name,
-                    "content": f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
-                    "tool_call_id": skipped_tc.id,
-                }
-                messages.append(skip_msg)
+                # Build via make_tool_result_message so the persisted message
+                # carries the internal 'tool_name' field (and goes through the
+                # same untrusted-wrap path) like every other tool result — the
+                # raw dict here persisted tool_name=NULL only for interrupt-
+                # skipped messages, which downstream consumers read as missing.
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
+                    skipped_tc.id,
+                ))
             break
 
         function_name = tool_call.function.name

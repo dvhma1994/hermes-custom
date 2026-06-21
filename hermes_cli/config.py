@@ -5925,7 +5925,15 @@ def save_env_value(key: str, value: str):
             pass
         raise
 
-    os.environ[key] = value
+    # Only mirror into the SHARED process os.environ when writing the active
+    # profile. Under a profile-scope override (dashboard editing a DIFFERENT
+    # profile's .env), mutating os.environ would clobber the running process's
+    # credentials with another profile's values — cross-profile leakage. The
+    # override is set by _profile_scope only for a non-current profile, so a
+    # None override means "this is the active profile".
+    from hermes_constants import get_hermes_home_override
+    if get_hermes_home_override() is None:
+        os.environ[key] = value
     invalidate_env_cache()
 
 
@@ -5985,7 +5993,12 @@ def remove_env_value(key: str) -> bool:
                 pass
             raise
 
-    os.environ.pop(key, None)
+    # See save_env_value: only touch the shared process os.environ when editing
+    # the ACTIVE profile, never when a profile-scope override targets another
+    # profile's .env (would drop a credential out of the running process).
+    from hermes_constants import get_hermes_home_override
+    if get_hermes_home_override() is None:
+        os.environ.pop(key, None)
     invalidate_env_cache()
     return found
 

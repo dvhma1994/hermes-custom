@@ -98,6 +98,18 @@ class TestFormatMessage:
         assert adapter.format_message("# **Title**") == "*Title*"
         assert adapter.format_message("## __Strong__") == "*Strong*"
 
+    def test_header_with_inline_bold_is_single_balanced_span(self):
+        """"# *Summary* of results" must not emit a literal "**" pair. The
+        header becomes one balanced WhatsApp bold span (*Summary of results*)."""
+        adapter = _make_adapter()
+        result = adapter.format_message("# *Summary* of results")
+        assert "**" not in result
+        assert result == "*Summary of results*"
+        # The reported repro: a bold fragment mid-header must not produce "**".
+        repro = adapter.format_message("# *important* note")
+        assert "**" not in repro
+        assert repro == "*important note*"
+
     def test_links_converted(self):
         adapter = _make_adapter()
         result = adapter.format_message("[click here](https://example.com)")

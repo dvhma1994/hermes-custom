@@ -166,7 +166,17 @@ def _read_skill_name(skill_md: Path, fallback: str) -> str:
             in_frontmatter = True
             continue
         if in_frontmatter and stripped.startswith("name:"):
-            value = stripped.split(":", 1)[1].strip().strip("\"'")
+            value = stripped.split(":", 1)[1].strip()
+            # Strip a trailing inline comment from a PLAIN (unquoted) YAML
+            # scalar so `name: realname  # legacy alias` resolves to
+            # `realname`, matching yaml.safe_load. A "#" inside a quoted
+            # scalar is literal (kept). Mirrors tools/skill_usage.py so the
+            # two name-resolution layers agree on the same skill identity.
+            if value and value[0] not in "\"'":
+                hash_idx = value.find(" #")
+                if hash_idx != -1:
+                    value = value[:hash_idx].rstrip()
+            value = value.strip("\"'")
             if value:
                 return value
     return fallback

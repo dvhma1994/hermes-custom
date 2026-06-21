@@ -452,7 +452,15 @@ def compress_context(
     except TypeError:
         # Plugin context engine with strict signature that doesn't accept
         # focus_topic / force — fall back to calling without them.
-        compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
+        try:
+            compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
+        except BaseException:
+            # A failure raised INSIDE this except handler is NOT caught by the
+            # sibling `except BaseException` below (sibling handlers never catch
+            # exceptions raised within another handler), so the lock would leak
+            # and stall this session's compression permanently. Release here too.
+            _release_lock()
+            raise
     except BaseException:
         # ANY exception during compress() must release the lock so the
         # session isn't permanently blocked from future compression.

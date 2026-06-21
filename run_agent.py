@@ -1879,7 +1879,10 @@ class AIAgent:
             if msg:
                 status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""
-                return AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
+                # `msg` can be a non-string truthy value (int/dict/list) from a
+                # malformed provider body; coerce before slicing so this error
+                # handler never masks the real failure with a TypeError.
+                return AIAgent._decorate_xai_entitlement_error(f"{prefix}{str(msg)[:300]}")
 
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)
@@ -3221,6 +3224,12 @@ class AIAgent:
             if msg.get("role") != "tool":
                 continue
             content = msg.get("content", "")
+            # content may be present-but-None or a multimodal list; the .get("")
+            # default only applies to a MISSING key. A todo response is always a
+            # JSON string, so skip anything non-string (None list-content would
+            # otherwise raise "argument of type 'NoneType' is not iterable").
+            if not isinstance(content, str):
+                continue
             # Quick check: todo responses contain "todos" key
             if '"todos"' not in content:
                 continue

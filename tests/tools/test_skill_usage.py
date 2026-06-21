@@ -773,3 +773,46 @@ def test_usage_report_covers_all_provenance(skills_home):
     for n in rows:
         assert rows[n]["use_count"] == 1
         assert rows[n]["_persisted"] is True
+
+
+# =========================================================================
+# _read_skill_name — YAML inline-comment handling
+# =========================================================================
+
+
+class TestReadSkillNameInlineComment:
+    """The line-based parser must agree with yaml.safe_load on plain scalars.
+
+    `name: realname  # legacy alias` is a plain YAML scalar with a trailing
+    comment; yaml.safe_load yields `realname`. The old parser returned
+    `realname  # legacy alias`, so two layers keyed telemetry under different
+    names. The fix strips a trailing ` # comment` from unquoted scalars only.
+    """
+
+    def test_plain_scalar_with_inline_comment(self, tmp_path):
+        from tools.skill_usage import _read_skill_name
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text(
+            "---\nname: realname  # legacy alias\ndescription: x\n---\n",
+            encoding="utf-8",
+        )
+        assert _read_skill_name(skill_md, fallback="fallback") == "realname"
+
+    def test_quoted_scalar_keeps_hash(self, tmp_path):
+        """A `#` inside a quoted value is literal, not a comment."""
+        from tools.skill_usage import _read_skill_name
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text(
+            "---\nname: \"foo#bar\"\ndescription: x\n---\n",
+            encoding="utf-8",
+        )
+        assert _read_skill_name(skill_md, fallback="fallback") == "foo#bar"
+
+    def test_plain_scalar_without_comment_unchanged(self, tmp_path):
+        from tools.skill_usage import _read_skill_name
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text(
+            "---\nname: plain-name\ndescription: x\n---\n",
+            encoding="utf-8",
+        )
+        assert _read_skill_name(skill_md, fallback="fallback") == "plain-name"

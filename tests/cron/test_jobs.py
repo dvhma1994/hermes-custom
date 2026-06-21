@@ -282,9 +282,12 @@ class TestJobCRUD:
         assert remove_job(job["id"]) is True
         assert get_job(job["id"]) is None
 
-    def test_remove_job_rejects_unsafe_legacy_id_before_output_cleanup(self, tmp_cron_dir):
-        """Legacy unsafe IDs left over from before the create-time guard
-        must fail closed without half-applying the removal."""
+    def test_remove_job_persists_removal_for_unsafe_legacy_id(self, tmp_cron_dir):
+        """A legacy unsafe ID (left over from before the create-time guard)
+        can't be mapped to a sandboxed output dir, but remove_job must still
+        delete the job record from storage — and must NOT follow the unsafe
+        path on disk. (Regression: previously the dir lookup raised before
+        save_jobs, so the record stayed in jobs.json forever.)"""
         job = create_job(prompt="Legacy unsafe", schedule="every 1h")
         job["id"] = "../escape"
         save_jobs([job])
@@ -292,11 +295,12 @@ class TestJobCRUD:
         outside.mkdir()
         (outside / "keep.txt").write_text("keep", encoding="utf-8")
 
-        with pytest.raises(ValueError, match="output path"):
-            remove_job("../escape")
+        # Removal succeeds — the record leaves storage and no exception is raised.
+        assert remove_job("../escape") is True
+        assert get_job("../escape") is None
+        assert all(j["id"] != "../escape" for j in load_jobs())
 
-        # Job should still be in the store and the escape dir untouched.
-        assert load_jobs()[0]["id"] == "../escape"
+        # The unsafe output dir path was rejected (not followed) — escape untouched.
         assert (outside / "keep.txt").exists()
 
     def test_remove_nonexistent_returns_false(self, tmp_cron_dir):
@@ -1092,3 +1096,23 @@ class TestSaveJobOutput:
         with pytest.raises(ValueError, match="output path"):
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
+
+    def test_same_second_outputs_are_distinct_files(self, tmp_cron_dir, monkeypatch):
+        """Two outputs saved in the same wall-clock second must not overwrite
+        each other (Bug: second-resolution filename collided silently)."""
+        from datetime import datetime as _dt
+        fixed = _dt(2026, 6, 15, 12, 0, 0)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: fixed)
+
+        first = save_job_output("job-x", "run one")
+        second = save_job_output("job-x", "run two")
+
+        assert first != second
+        assert first.exists()
+        assert second.exists()
+        # Both runs' contents are preserved, neither overwrote the other.
+        assert first.read_text() == "run one"
+        assert second.read_text() == "run two"
+        # Both keep the human-readable second-resolution timestamp prefix.
+        assert str(first).endswith(".md")
+        assert str(second).endswith(".md")

@@ -1573,13 +1573,16 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
     ptype = part.get("type")
 
     if ptype == "input_text":
-        block: Dict[str, Any] = {"type": "text", "text": part.get("text", "")}
+        # ``or ""`` (not the .get default): a present-but-None text would send
+        # text:None to the wire and HTTP-400. Closes the mixed-case H3-34
+        # residual at its root (a null text part alongside a real one).
+        block: Dict[str, Any] = {"type": "text", "text": part.get("text") or ""}
     elif ptype == "text":
         # A stored Anthropic text block. Rebuild from whitelisted fields only —
         # SDK response text blocks carry output-only siblings (parsed_output,
         # citations=None) that the Messages INPUT schema rejects with HTTP 400
         # "Extra inputs are not permitted". Do NOT dict(part) it verbatim.
-        block = {"type": "text", "text": part.get("text", "")}
+        block = {"type": "text", "text": part.get("text") or ""}
         cits = part.get("citations")
         if isinstance(cits, list) and cits:
             block["citations"] = cits
@@ -1882,7 +1885,12 @@ def _convert_tool_message_to_result(
             ]
     elif isinstance(content, list):
         converted = _content_parts_to_anthropic_blocks(content)
-        if any(b.get("type") == "image" for b in converted):
+        # Use the converted Anthropic blocks for ANY non-empty list content, not
+        # just image-bearing lists. A text-only list previously fell through and
+        # got json.dumps()'d, sending the raw OpenAI part structure
+        # ([{"type":"text","text":...}]) to the model as a literal JSON string
+        # instead of the extracted text.
+        if converted:
             multimodal_blocks = converted
     # Back-compat: some callers stash blocks under a private key.
     if multimodal_blocks is None:
@@ -1927,7 +1935,7 @@ def _convert_user_message(content: Any) -> Dict[str, Any]:
     if isinstance(content, list):
         converted_blocks = _convert_content_to_anthropic(content)
         if not converted_blocks or all(
-            b.get("text", "").strip() == ""
+            (b.get("text") or "").strip() == ""
             for b in converted_blocks
             if isinstance(b, dict) and b.get("type") == "text"
         ):

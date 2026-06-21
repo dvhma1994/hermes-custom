@@ -571,8 +571,19 @@ def _normalize_command_for_detection(command: str) -> str:
     command = unicodedata.normalize('NFKC', command)
     # Strip shell backslash-escapes: r\m → rm. Prevents \-injection bypass.
     command = re.sub(r'\\([^\n])', r'\1', command)
-    # Strip empty-string literals that split tokens: r''m → rm, r"\"m → rm.
-    command = re.sub(r"''|\"\"", '', command)
+    # Strip matched quote pairs around content (not just EMPTY pairs): the shell
+    # removes quotes during word-splitting, so `rm -rf "/"`, `dd of="/dev/sda"`
+    # and `"shutdown" now` are shell-identical to their unquoted forms. Without
+    # this, quoting any path/command word bypassed the hardline floor entirely
+    # (security: yolo/approvals.mode=off would then execute an unrecoverable
+    # command). The command-position anchoring in the patterns prevents false
+    # positives from dangerous phrases sitting inside a benign command's quoted
+    # argument. Loop to collapse adjacent/concatenated quoting like `"r""m"`.
+    _prev = None
+    while _prev != command:
+        _prev = command
+        command = re.sub(r'"([^"]*)"', r'\1', command)
+        command = re.sub(r"'([^']*)'", r'\1', command)
     # Fold the current user's resolved absolute home path into ~/ at detection
     # time so static user-sensitive patterns catch /home/alice/.bashrc the same
     # way they catch ~/.bashrc. Do not snapshot this at import time: tests and
@@ -657,13 +668,28 @@ def detect_dangerous_command(command: str) -> tuple:
 
     Returns:
         (is_dangerous, pattern_key, description) or (False, None, None)
+
+    When a SINGLE command matches MULTIPLE distinct dangerous patterns (e.g.
+    ``rm -rf x && git push --force`` = "recursive delete" + "git force push"),
+    the returned ``pattern_key`` is the COMBINATION of all matched patterns —
+    NOT just the first. Otherwise a prior session approval of one common pattern
+    (e.g. "recursive delete") would silently authorize an unrelated destructive
+    op bundled into the same command, because only the first match's key was ever
+    consulted against the allowlist. The combined key forces fresh approval for
+    each distinct combination and the description lists every matched pattern.
     """
     command_lower = _normalize_command_for_detection(command).lower()
-    for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
-        if pattern_re.search(command_lower):
-            pattern_key = description
-            return (True, pattern_key, description)
-    return (False, None, None)
+    matches = [
+        description
+        for pattern_re, description in DANGEROUS_PATTERNS_COMPILED
+        if pattern_re.search(command_lower)
+    ]
+    if not matches:
+        return (False, None, None)
+    if len(matches) == 1:
+        return (True, matches[0], matches[0])
+    uniq = sorted(set(matches))
+    return (True, " + ".join(uniq), "; ".join(uniq))
 
 
 # =========================================================================

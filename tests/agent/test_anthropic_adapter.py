@@ -1040,6 +1040,20 @@ class TestConvertMessages:
         assert isinstance(result[0]["content"], list)
         assert result[0]["content"] == [{"type": "text", "text": "(empty message)"}]
 
+    def test_user_message_with_null_text_block_gets_placeholder(self):
+        """A text part with explicit ``text: None`` must not crash.
+
+        Regression: ``b.get("text", "").strip()`` returned None (key present,
+        value None) and raised AttributeError. The null text is treated as
+        empty so the part becomes the existing '(empty message)' placeholder.
+        """
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": None}]},
+        ]
+        _, result = convert_messages_to_anthropic(messages)
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == [{"type": "text", "text": "(empty message)"}]
+
 
 # ---------------------------------------------------------------------------
 # Build kwargs

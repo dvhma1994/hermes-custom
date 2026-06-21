@@ -116,9 +116,11 @@ def test_drift_snapshot_misalignment_not_sourced_from_drift():
         b = LearningEvidenceBuilder(store._conn, "strategy:coding")
         b.build_and_persist(store.get_session(sid), store.get_turns(sid))
 
-    # drift=0.12, misalignment=0.03 -> avg_drift=0.12, avg_alignment=97.0
+    # drift_pct/misalignment_pct are on the production 0-100 PERCENT scale
+    # (collectors store (n/total)*100): 12% drift, 3% misaligned ->
+    # avg_drift=0.12 (fraction), avg_alignment=97.0 (percent).
     for _ in range(5):
-        _seed(str(uuid.uuid4()), drift=0.12, misalign=0.03)
+        _seed(str(uuid.uuid4()), drift=12.0, misalign=3.0)
 
     monitor = StrategyDriftMonitor(store._conn)
     snap = monitor.snapshot("strategy:coding")
@@ -240,3 +242,231 @@ def test_impossible_cron_compute_next_run_returns_none_not_raises():
     # a valid cron still yields a concrete next-run timestamp
     nxt = compute_next_run({"kind": "cron", "expr": _VALID_CRON})
     assert isinstance(nxt, str) and nxt
+
+
+# ── Hunt-2 #7 & #12: a tz-naive ISO timestamp (no offset) was parsed as host-local
+# time instead of UTC, shifting credential-exhaustion cooldowns / nous pool-entry
+# expiry ordering by the host's UTC offset. The canonical sibling parsers
+# (hermes_cli/auth.py, tools/skill_usage.py) tag naive values as UTC; these two
+# did not. Under the suite's pinned TZ=UTC the bug is invisible, so we force a
+# non-UTC zone (POSIX tzset) to make the pre-fix code fail. ───────────────────────
+import os
+import time
+from datetime import datetime, timezone
+
+_NAIVE_ISO = "2026-09-01T00:00:00"
+_UTC_EPOCH = datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc).timestamp()  # 1788220800.0
+
+
+def _force_non_utc(monkeypatch):
+    """Pin local tz to UTC+5:30 (no DST) where the platform supports it.
+
+    Returns True if the host tz was actually changed (POSIX). On Windows there
+    is no time.tzset(), so the UTC-correctness invariant is still asserted but
+    the naive-vs-local divergence can't be forced; CI (Linux) exercises both.
+    """
+    if not hasattr(time, "tzset"):
+        return False
+    monkeypatch.setenv("TZ", "Asia/Kolkata")  # UTC+05:30, DST-free
+    time.tzset()
+    return True
+
+
+def test_credential_pool_naive_reset_parsed_as_utc(monkeypatch):
+    from agent.credential_pool import _parse_absolute_timestamp
+    try:
+        _force_non_utc(monkeypatch)
+        # Pre-fix on a non-UTC host this returned the host-local epoch (off by
+        # the UTC offset); the fix anchors naive values to UTC.
+        assert _parse_absolute_timestamp(_NAIVE_ISO) == _UTC_EPOCH
+        # tz-aware / Z inputs were always correct and must stay correct.
+        assert _parse_absolute_timestamp(_NAIVE_ISO + "+00:00") == _UTC_EPOCH
+        assert _parse_absolute_timestamp(_NAIVE_ISO + "Z") == _UTC_EPOCH
+    finally:
+        if hasattr(time, "tzset"):
+            time.tzset()  # restore after monkeypatch reverts TZ
+
+
+def test_nous_account_naive_expiry_parsed_as_utc(monkeypatch):
+    from hermes_cli.nous_account import _parse_iso_timestamp
+    try:
+        _force_non_utc(monkeypatch)
+        assert _parse_iso_timestamp(_NAIVE_ISO) == _UTC_EPOCH
+        assert _parse_iso_timestamp(_NAIVE_ISO + "+00:00") == _UTC_EPOCH
+        assert _parse_iso_timestamp(_NAIVE_ISO + "Z") == _UTC_EPOCH
+    finally:
+        if hasattr(time, "tzset"):
+            time.tzset()
+
+
+# ── Hunt-2 #3: _detect_tool_failure raised TypeError on a memory result whose
+# 'error' value is null/non-string ('"..." in None'). The key is present so the
+# .get("error","") default never applied. Must classify, never raise. ─────────────
+def test_detect_tool_failure_never_raises_on_null_error():
+    from agent.display import _detect_tool_failure
+    for result in (
+        '{"success": false, "error": null}',
+        '{"success": false, "error": 0}',
+        '{"success": false, "error": [1, 2]}',
+    ):
+        out = _detect_tool_failure("memory", result)  # pre-fix: TypeError
+        assert isinstance(out, tuple) and len(out) == 2
+        assert isinstance(out[0], bool) and isinstance(out[1], str)
+    # real "store full" classification preserved
+    assert _detect_tool_failure(
+        "memory", '{"success": false, "error": "you exceed the limit"}'
+    ) == (True, " [full]")
+
+
+# ── Hunt-2 #2: enforce_turn_budget sized a multimodal (list) tool result by
+# len(list) = number of parts, not characters, so a 250k-char text part counted
+# as ~2 and slipped under the 200k turn budget with no protection. ────────────────
+def test_enforce_turn_budget_sizes_multimodal_list_by_chars():
+    from tools.tool_result_storage import enforce_turn_budget, DEFAULT_BUDGET, _content_char_size
+    big = "Q" * 250_000
+    msg = {
+        "role": "tool", "name": "vision_analyze", "tool_call_id": "c1",
+        "content": [
+            {"type": "text", "text": big},
+            {"type": "image_url", "image_url": {"url": "x"}},
+        ],
+    }
+    assert _content_char_size(msg["content"]) > DEFAULT_BUDGET.turn_budget
+    out = enforce_turn_budget([msg], env=None, config=DEFAULT_BUDGET)
+    content = out[0]["content"]
+    # Pre-fix: nothing changed (early return). Now: oversized text spilled,
+    # image part preserved, total back under budget.
+    assert _content_char_size(content) <= DEFAULT_BUDGET.turn_budget
+    text_parts = [p for p in content if isinstance(p, dict) and "text" in p]
+    img_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "image_url"]
+    assert big not in text_parts[0]["text"]
+    assert len(img_parts) == 1
+
+
+def test_enforce_turn_budget_string_path_still_works():
+    from tools.tool_result_storage import enforce_turn_budget, DEFAULT_BUDGET, PERSISTED_OUTPUT_TAG
+    msg = {"role": "tool", "tool_call_id": "s1", "content": "Z" * 250_000}
+    out = enforce_turn_budget([msg], env=None, config=DEFAULT_BUDGET)
+    assert len(out[0]["content"]) < 250_000  # truncated/persisted
+
+
+# ── Hunt-2 #4: _content_length_for_budget counted raw base64 for the _multimodal
+# DICT envelope (~20x over-count) because it's not a list and fell through to
+# len(str(...)). The list shape already strips base64; the two must agree. ─────────
+def test_content_length_multimodal_dict_strips_base64():
+    from agent.context_compressor import _content_length_for_budget, _IMAGE_CHAR_EQUIVALENT
+    b64 = "A" * 120_000
+    list_form = [{"type": "image", "source": {"data": b64}}]
+    dict_form = {"_multimodal": True, "text_summary": "shot",
+                 "content": [{"type": "image", "source": {"data": b64}}]}
+    L = _content_length_for_budget(list_form)
+    D = _content_length_for_budget(dict_form)
+    assert L == _IMAGE_CHAR_EQUIVALENT
+    assert D < 10_000  # pre-fix ~120107
+    assert abs(D - L) <= len("shot") + 4
+
+
+# ── Hunt-2 #6: cron SILENT delivery suppression used a case-insensitive SUBSTRING
+# match, silently dropping legit reports that merely mention the token. Suppress
+# only when [SILENT] is used as a directive (leads / alone on a line). ─────────────
+def test_cron_silent_directive_boundary():
+    from cron.scheduler import _is_silent_directive
+    # directive -> suppress (preserves intended leniency)
+    for s in ("[SILENT]", "[SILENT] No changes", "[silent] nothing new",
+              "long report...\n\n[SILENT]", "  [Silent]  "):
+        assert _is_silent_directive(s) is True, s
+    # mere mention -> deliver (the bug)
+    for s in ("All systems normal. phone is in [silent] mode right now.",
+              "Report: the user set notifications to [SILENT]."):
+        assert _is_silent_directive(s) is False, s
+
+
+# ── Hunt-2 #8: the rate-limit "resets in" parser used \b after each unit, which
+# is absent between a unit letter and a digit ("2h30m": h->3), so compact
+# multi-unit durations failed to parse. ───────────────────────────────────────────
+def test_extract_api_error_compact_duration():
+    from agent.agent_runtime_helpers import extract_api_error_context
+    import time as _t
+
+    def secs(msg):
+        c = extract_api_error_context(Exception(msg))
+        return None if "reset_at" not in c else round(c["reset_at"] - _t.time())
+
+    assert abs(secs("Rate limited. Resets in 2h30m.") - 9000) <= 2
+    assert abs(secs("Resets in 1h15m") - 4500) <= 2
+    assert abs(secs("Resets in 2h 30m") - 9000) <= 2      # spaced form still ok
+    assert abs(secs("Resets in 4hr 5min") - 14700) <= 2
+    assert abs(secs("Resets in 2hours") - 7200) <= 2      # full word not split at 'h'
+
+
+# ── Hunt-2 #9: the concurrent-tools heartbeat indexed parsed_calls by future
+# position, but futures is built only from runnable_calls (blocked calls
+# excluded), so a leading blocked call shifted every reported name. ────────────────
+def test_running_tool_names_skips_blocked_offset():
+    from agent.tool_executor import _running_tool_names
+    parsed_calls = [
+        ("tc0", "delete_everything", "a0", "mw0", "BLOCKED", True),
+        ("tc1", "read_file", "a1", "mw1", None, False),
+        ("tc2", "web_search", "a2", "mw2", None, False),
+    ]
+    runnable_calls = [
+        (i, tc, name, args)
+        for i, (tc, name, args, mw, br, bg) in enumerate(parsed_calls)
+        if br is None
+    ]
+    futures = ["F1", "F2"]  # parallel to runnable_calls
+    not_done = ["F1", "F2"]
+    assert _running_tool_names(not_done, futures, runnable_calls) == ["read_file", "web_search"]
+
+
+# ── Hunt-2 #10: compress() with abort_on_summary_failure reassigned `messages`
+# to the lossily-pruned list BEFORE the abort check, so the "preserved unchanged /
+# frozen" path actually returned a mutated transcript. ────────────────────────────
+def test_compress_abort_returns_byte_for_byte_original():
+    import copy as _copy
+    from agent.context_compressor import ContextCompressor
+    c = ContextCompressor(model="test/mock", protect_first_n=1, protect_last_n=3,
+                          quiet_mode=True, abort_on_summary_failure=True)
+    c._generate_summary = lambda *a, **k: None  # force summary failure
+    dup = "X" * 900
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "do a thing"},
+    ]
+    for i in range(1, 5):
+        messages.append({"role": "assistant",
+                         "tool_calls": [{"id": f"t{i}", "function": {"name": "read_file", "arguments": "{}"}}]})
+        messages.append({"role": "tool", "tool_call_id": f"t{i}", "content": dup})
+    messages += [
+        {"role": "user", "content": "and another"},
+        {"role": "assistant", "content": "ok done"},
+        {"role": "user", "content": "thanks"},
+    ]
+    snapshot = _copy.deepcopy(messages)
+    out = c.compress(messages, current_tokens=10_000_000, force=True)
+    assert c._last_compress_aborted is True
+    assert out == snapshot  # byte-for-byte, duplicate tool results not pruned
+    assert all(m["content"] == dup for m in out if m.get("role") == "tool")
+
+
+# ── Hunt-2 #5: Slack markdown-link label was stashed behind a placeholder before
+# the escaping pass, so '<'/'>'/'&' in the label broke the <url|label> entity. ─────
+def test_slack_link_label_is_escaped():
+    import gateway.platforms.slack as s
+    f = lambda c: s.SlackAdapter.format_message(None, c)
+    assert f("[x > y here](https://x.com)") == "<https://x.com|x &gt; y here>"
+    assert f("[Tom & Jerry](https://x.com)") == "<https://x.com|Tom &amp; Jerry>"
+    assert f("[a < b](https://x.com)") == "<https://x.com|a &lt; b>"
+
+
+# ── Hunt-2 #11: Telegram MarkdownV2 step-12 safety net escaped '(' inside a link
+# URL, corrupting the target (.../Mercury_\(element) → 404). It must stay bare. ─────
+def test_telegram_keeps_url_paren_bare():
+    import gateway.platforms.telegram as t
+    out = t.TelegramAdapter.format_message(
+        None, "See [Mercury (element)](https://en.wikipedia.org/wiki/Mercury_(element))"
+    )
+    # URL '(' bare, URL ')' escaped; display-text parens escaped
+    assert "Mercury_(element" in out
+    assert "Mercury_\\(element" not in out
+    assert "[Mercury \\(element\\)]" in out

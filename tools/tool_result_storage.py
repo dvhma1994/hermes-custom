@@ -178,6 +178,75 @@ def maybe_persist_tool_result(
     )
 
 
+def _content_char_size(content) -> int:
+    """Character size of a tool-result content (str OR multimodal list).
+
+    A multimodal result is a list of parts (e.g. ``{"type":"text","text":...}``
+    and ``{"type":"image_url",...}``). ``len(list)`` counts PARTS, not chars, so
+    a single 250k-char text part would size as 1 — undercounting by ~250000x and
+    defeating the turn budget. Sum the text-part lengths instead.
+    """
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                total += len(text) if isinstance(text, str) else len(str(part))
+            else:
+                total += len(str(part))
+        return total
+    return len(str(content or ""))
+
+
+def _content_has_persisted_tag(content) -> bool:
+    """True if a str/list content already carries the persisted-output tag.
+
+    For a list, ``TAG in content`` is a list-MEMBERSHIP test (is the tag one of
+    the parts), never a substring test, so it would miss an already-persisted
+    text part. Check the text parts explicitly.
+    """
+    if isinstance(content, str):
+        return PERSISTED_OUTPUT_TAG in content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and PERSISTED_OUTPUT_TAG in text:
+                    return True
+            elif isinstance(part, str) and PERSISTED_OUTPUT_TAG in part:
+                return True
+        return False
+    return PERSISTED_OUTPUT_TAG in str(content or "")
+
+
+def _persist_list_text_parts(content, tool_use_id, env, config):
+    """Persist/truncate oversized TEXT parts of a multimodal list in place.
+
+    Keeps non-text parts (images) intact; only the large text parts — the ones
+    that actually overflow context — are spilled to the sandbox. Returns a new
+    parts list (or the original object if nothing changed).
+    """
+    changed = False
+    new_parts = []
+    for j, part in enumerate(content):
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            replaced = maybe_persist_tool_result(
+                content=part["text"],
+                tool_name=_BUDGET_TOOL_NAME,
+                tool_use_id=f"{tool_use_id}_part{j}",
+                env=env,
+                config=config,
+                threshold=0,
+            )
+            if replaced != part["text"]:
+                part = {**part, "text": replaced}
+                changed = True
+        new_parts.append(part)
+    return (new_parts if changed else content)
+
+
 def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
@@ -187,7 +256,7 @@ def enforce_turn_budget(
 
     If total chars exceed budget, persist the largest non-persisted results
     first (via sandbox write) until under budget. Already-persisted results
-    are skipped.
+    are skipped. Handles both string and multimodal-list tool results.
 
     Mutates the list in-place and returns it.
     """
@@ -195,9 +264,9 @@ def enforce_turn_budget(
     total_size = 0
     for i, msg in enumerate(tool_messages):
         content = msg.get("content", "")
-        size = len(content)
+        size = _content_char_size(content)
         total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
+        if not _content_has_persisted_tag(content):
             candidates.append((i, size))
 
     if total_size <= config.turn_budget:
@@ -211,6 +280,18 @@ def enforce_turn_budget(
         msg = tool_messages[idx]
         content = msg["content"]
         tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
+
+        if isinstance(content, list):
+            new_content = _persist_list_text_parts(content, tool_use_id, env, config)
+            if new_content is not content:
+                new_size = _content_char_size(new_content)
+                total_size -= (size - new_size)
+                tool_messages[idx]["content"] = new_content
+                logger.info(
+                    "Budget enforcement: persisted multimodal tool result %s "
+                    "(%d -> %d chars)", tool_use_id, size, new_size,
+                )
+            continue
 
         replacement = maybe_persist_tool_result(
             content=content,

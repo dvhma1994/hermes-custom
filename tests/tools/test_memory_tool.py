@@ -544,24 +544,27 @@ class TestExternalDriftGuard:
         assert path.stat().st_size == original_size
 
     def test_drift_backup_filename_is_unique_per_invocation(self, store):
-        """Two drift refusals close together must not collide on bak.<ts>.
+        """Two drift refusals in the same second must NOT collide.
 
-        If two refusals share the same epoch second, the second call would
-        overwrite the first .bak. The current implementation accepts that
-        — both files describe the same on-disk state — but pin the path
-        format here so any future change has to think about it.
+        A bare `.bak.<ts>` let the second write_text() clobber the first
+        snapshot when both refusals shared an epoch second. Each drift must
+        produce a distinct on-disk .bak so no snapshot is lost (#26045).
         """
         store.add("memory", "Initial.")
         self._plant_drift(store)
 
         r1 = store.replace("memory", "Initial", "Replacement.")
         r2 = store.add("memory", "Another.")
-        assert r1.get("drift_backup")
-        assert r2.get("drift_backup")
-        # Same epoch second is the expected collision case — both point
-        # at the same snapshot. Different second is also fine.
-        assert ".bak." in r1["drift_backup"]
-        assert ".bak." in r2["drift_backup"]
+        bak1 = r1.get("drift_backup")
+        bak2 = r2.get("drift_backup")
+        assert bak1 and bak2
+        # Distinct paths — the second snapshot must not overwrite the first.
+        assert bak1 != bak2
+        # Both snapshots survive on disk.
+        assert Path(bak1).exists()
+        assert Path(bak2).exists()
+        assert ".bak." in bak1
+        assert ".bak." in bak2
 
 
 # =========================================================================

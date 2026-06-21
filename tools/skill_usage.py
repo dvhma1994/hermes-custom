@@ -406,7 +406,18 @@ def _read_skill_name(skill_md: Path, fallback: str) -> str:
             in_frontmatter = True
             continue
         if in_frontmatter and stripped.startswith("name:"):
-            value = stripped.split(":", 1)[1].strip().strip("\"'")
+            value = stripped.split(":", 1)[1].strip()
+            # Strip a trailing inline comment from a PLAIN (unquoted) YAML
+            # scalar so `name: realname  # legacy alias` resolves to
+            # `realname`, matching yaml.safe_load. A "#" inside a quoted
+            # scalar is literal, not a comment — only plain scalars are
+            # affected, and only when the "#" is preceded by whitespace
+            # (YAML spec).
+            if value and value[0] not in "\"'":
+                hash_idx = value.find(" #")
+                if hash_idx != -1:
+                    value = value[:hash_idx].rstrip()
+            value = value.strip("\"'")
             if value:
                 return value
     return fallback
@@ -755,7 +766,24 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     # Try exact name match first, then the timestamped-duplicate fallback.
     # Recursive walk handles nested archive layouts (e.g. .archive/<category>/<skill>/)
     # left behind by older archive paths or external imports.
-    candidates = [p for p in archive_root.rglob("*") if p.is_dir() and p.name == skill_name]
+    #
+    # Match by the archived skill's *frontmatter* name (the canonical identity
+    # used by state/suppression/_find_skill_dir), not just the directory name:
+    # archive_skill() writes the dest under the on-disk DIR name, which can
+    # differ from the frontmatter name, so a pure ``p.name == skill_name`` search
+    # could never find such an archive and the archive/restore round-trip broke.
+    def _archived_frontmatter_name(d: Path) -> Optional[str]:
+        md = d / "SKILL.md"
+        if not md.exists():
+            return None
+        return _read_skill_name(md, fallback=d.name)
+
+    candidates = [
+        p for p in archive_root.rglob("*")
+        if p.is_dir() and (
+            p.name == skill_name or _archived_frontmatter_name(p) == skill_name
+        )
+    ]
     if not candidates:
         # A name collision makes archive_skill() disambiguate by appending its
         # UTC timestamp ("<skill>-YYYYMMDDHHMMSS", a 14-digit suffix), so only

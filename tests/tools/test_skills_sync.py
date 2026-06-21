@@ -156,6 +156,17 @@ class TestReadSkillName:
         skill_md.write_text('---\nname: "serving-llms-vllm"\n---\n')
         assert _read_skill_name(skill_md, "vllm") == "serving-llms-vllm"
 
+    def test_strips_inline_comment_from_plain_scalar(self, tmp_path):
+        """Inline comments must not leak into the parsed name.
+
+        `name: realname  # legacy alias` is a plain YAML scalar with a
+        trailing comment; must resolve to `realname`, matching yaml.safe_load
+        and tools/skill_usage._read_skill_name so both layers key the same id.
+        """
+        skill_md = tmp_path / "SKILL.md"
+        skill_md.write_text("---\nname: realname  # legacy alias\n---\n")
+        assert _read_skill_name(skill_md, "fallback") == "realname"
+
     def test_discover_uses_frontmatter_name(self, tmp_path):
         skill_dir = tmp_path / "category" / "audiocraft"
         skill_dir.mkdir(parents=True)

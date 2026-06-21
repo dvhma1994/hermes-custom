@@ -226,6 +226,17 @@ def _content_length_for_budget(raw_content: Any) -> int:
     """
     if isinstance(raw_content, str):
         return len(raw_content)
+    # Multimodal DICT envelope: {"_multimodal": True, "text_summary": ...,
+    # "content": [ ...parts... ]}. It is not a list, so without this it would
+    # fall through to len(str(...)) and count the raw base64 payload (~20x
+    # over-count vs the list shape and estimate_messages_tokens_rough). Budget
+    # it from its inner parts + summary instead.
+    if isinstance(raw_content, dict) and raw_content.get("_multimodal"):
+        inner = raw_content.get("content")
+        total = len(str(raw_content.get("text_summary") or ""))
+        if isinstance(inner, list):
+            total += _content_length_for_budget(inner)
+        return total
     if not isinstance(raw_content, list):
         return len(str(raw_content or ""))
 
@@ -484,6 +495,11 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
     try:
         args = json.loads(tool_args) if tool_args else {}
     except (json.JSONDecodeError, TypeError):
+        args = {}
+    # json.loads may succeed yet return a non-object (e.g. '42', '"x"', '[1,2]');
+    # the subsequent args.get(...) would then raise AttributeError and abort the
+    # whole compaction. Normalize any non-dict to {} (generic placeholder path).
+    if not isinstance(args, dict):
         args = {}
 
     content = tool_content or ""
@@ -2197,6 +2213,14 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
+        # Preserve the caller's ORIGINAL list so the abort_on_summary_failure
+        # path can truly return it unchanged. _prune_old_tool_results below
+        # returns a NEW list (it copies every message), reassigning ``messages``
+        # to a lossily-pruned version — returning that on abort would contradict
+        # the "preserved unchanged / frozen" contract. (_prune does not mutate
+        # the input, so this reference stays byte-for-byte intact.)
+        original_messages = messages
+
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
@@ -2306,7 +2330,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "frozen until the next /compress or /new.",
                     n_skipped,
                 )
-            return messages
+            # Return the ORIGINAL list (not the pre-pruned one) so the
+            # conversation really is frozen/intact for the user's retry.
+            return original_messages
 
         # Phase 4: Assemble compressed message list
         compressed = []
