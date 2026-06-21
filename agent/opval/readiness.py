@@ -222,9 +222,10 @@ class ReadinessGateEngine:
     ) -> float:
         if not root_error_sessions:
             return 1.0
-        recovered = 0
+        recovered_roots: Set[str] = set()
         for s in eligible_sessions:
             root = s.get("root_session_id") or s["session_id"]
             if root in root_error_sessions and s.get("outcome") == "success":
-                recovered += 1
-        return recovered / max(len(root_error_sessions), 1)
+                recovered_roots.add(root)
+        rate = len(recovered_roots) / len(root_error_sessions)
+        return max(0.0, min(1.0, rate))

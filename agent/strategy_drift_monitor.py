@@ -54,7 +54,7 @@ class StrategyDriftMonitor:
             snapshot_id=str(uuid.uuid4()),
             strategy_id=strategy_id,
             drift_pct=drift_pct,
-            misalignment_pct=current.avg_drift,
+            misalignment_pct=max(0.0, 1.0 - current.avg_alignment / 100.0),
             win_rate=current.win_rate,
             avg_score=current.avg_score,
             avg_alignment=current.avg_alignment,

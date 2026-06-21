@@ -83,6 +83,107 @@ def test_session_reset_policy_coerces_and_handles_string_exclude():
     assert SessionResetPolicy.from_dict({"at_hour": "oops"}).at_hour == 4   # bad -> default
 
 
+# ── Bug #6: StrategyDriftMonitor.snapshot populated misalignment_pct from
+# avg_drift (drift) instead of the misalignment signal (derived from
+# avg_alignment).  The persisted misalignment_pct equalled drift_pct. ────────
+def test_drift_snapshot_misalignment_not_sourced_from_drift():
+    import uuid
+    from agent.learning_evidence_builder import LearningEvidenceBuilder
+    from agent.opval.store import OpvalStore
+    from agent.strategy_drift_monitor import StrategyDriftMonitor
+
+    store = OpvalStore(":memory:")
+
+    def _seed(sid, drift, misalign):
+        store.insert_session({
+            "session_id": sid, "task_id": "t", "parent_session_id": None,
+            "root_session_id": sid, "platform": "test", "primary_domain": "coding",
+            "secondary_domains": "[]", "start_time": 1.0, "end_time": 2.0,
+            "turn_count": 1, "tool_execution_count": 1, "outcome": "success",
+            "session_quality_score": 0.9, "session_tool_correctness": 0.9,
+            "drift_pct": drift, "misalignment_pct": misalign,
+            "promotion_score": 0.9, "synthetic": 0, "synthetic_reason": None,
+            "opval_enabled": 1, "recorded_at": 2.0,
+        })
+        store.insert_turn({
+            "turn_id": str(uuid.uuid4()), "session_id": sid, "turn_number": 1,
+            "outcome": "success", "tool_calls": "[]", "tool_outputs": "[]",
+            "error_class": None, "latency_ms": 100, "tokens_used": 50,
+            "quality_score": 0.9, "tool_execution_score": 0.9,
+            "drift_flag": 0, "misalignment_flag": 0, "checkpoint_event": None,
+            "started_at": 1.0, "ended_at": 2.0,
+        })
+        b = LearningEvidenceBuilder(store._conn, "strategy:coding")
+        b.build_and_persist(store.get_session(sid), store.get_turns(sid))
+
+    # drift=0.12, misalignment=0.03 -> avg_drift=0.12, avg_alignment=97.0
+    for _ in range(5):
+        _seed(str(uuid.uuid4()), drift=0.12, misalign=0.03)
+
+    monitor = StrategyDriftMonitor(store._conn)
+    snap = monitor.snapshot("strategy:coding")
+    eff = monitor._effectiveness.evaluate("strategy:coding")
+
+    expected = max(0.0, 1.0 - eff.avg_alignment / 100.0)
+    assert abs(expected - 0.03) < 0.01                         # sanity
+    assert abs(snap.misalignment_pct - expected) < 0.01        # must be ~0.03
+    assert abs(snap.misalignment_pct - eff.avg_drift) > 0.01   # must NOT be 0.12
+
+
+# ── Bug #7: count_sessions(synthetic=1) always returned 0 because
+# get_eligible_sessions hard-coded WHERE synthetic=0, so the synthetic filter
+# in count_sessions operated on an already-empty list. ──────────────────────
+def test_count_sessions_synthetic_filter_works():
+    import uuid
+    from agent.opval.store import OpvalStore
+
+    store = OpvalStore(":memory:")
+
+    def _seed(sid, synthetic):
+        store.insert_session({
+            "session_id": sid, "task_id": "t", "parent_session_id": None,
+            "root_session_id": sid, "platform": "test", "primary_domain": "coding",
+            "secondary_domains": "[]", "start_time": 10.0, "end_time": 11.0,
+            "turn_count": 3, "tool_execution_count": 2, "outcome": "success",
+            "session_quality_score": 0.9, "session_tool_correctness": 0.9,
+            "drift_pct": 0.04, "misalignment_pct": 0.04,
+            "promotion_score": 0.9, "synthetic": synthetic, "synthetic_reason": None,
+            "opval_enabled": 1, "recorded_at": 11.0,
+        })
+
+    for _ in range(3):
+        _seed(str(uuid.uuid4()), synthetic=0)   # real
+    for _ in range(2):
+        _seed(str(uuid.uuid4()), synthetic=1)   # synthetic
+
+    assert store.count_sessions() == 5                    # all
+    assert store.count_sessions(synthetic=0) == 3         # real only
+    assert store.count_sessions(synthetic=1) == 2         # synthetic only
+
+
+# ── Bug #8: ReadinessGateEngine._estimate_recovery counted sessions instead of
+# distinct recovered error-roots, so the rate could exceed 1.0 and inflate the
+# RG05 promotion score.  Fix: count distinct roots, clamp to [0, 1]. ─────────
+def test_estimate_recovery_counts_distinct_roots_and_clamps():
+    from agent.opval.readiness import ReadinessGateEngine
+
+    engine = ReadinessGateEngine.__new__(ReadinessGateEngine)
+    root_error_sessions = {"err1", "err2", "err3", "err4", "err5"}  # 5 error roots
+    # err1 has 3 successful child sessions, err3 has 2, err4 has 1
+    # -> 3 distinct recovered roots / 5 total = 0.60
+    eligible = [
+        {"session_id": "s1", "root_session_id": "err1", "outcome": "success"},
+        {"session_id": "s2", "root_session_id": "err1", "outcome": "success"},
+        {"session_id": "s3", "root_session_id": "err1", "outcome": "success"},
+        {"session_id": "s4", "root_session_id": "err3", "outcome": "success"},
+        {"session_id": "s5", "root_session_id": "err3", "outcome": "success"},
+        {"session_id": "s6", "root_session_id": "err4", "outcome": "success"},
+    ]
+    rate = engine._estimate_recovery(eligible, root_error_sessions)
+    assert rate == 0.60                  # 3 distinct roots / 5, not 6/5 = 1.2
+    assert 0.0 <= rate <= 1.0
+
+
 # ── Bug #9: allow_self_delegate=True silently re-enabled self-delegation even when
 # the policy forbade it (no_self_delegate). More-restrictive must win. ───────────
 def test_no_self_delegate_policy_not_clobbered_by_allow_true():

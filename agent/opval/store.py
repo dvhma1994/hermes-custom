@@ -415,20 +415,24 @@ class OpvalStore:
         min_turns: int = 3,
         min_tool_executions: int = 1,
         state_db_conn: Optional[sqlite3.Connection] = None,
+        synthetic: Optional[int] = 0,
     ) -> List[Dict[str, Any]]:
-        """Return RG01-eligible sessions within window with required evidence."""
-        cur = self._conn.execute(
-            """
-            SELECT * FROM opval_sessions
-            WHERE synthetic = 0
-              AND outcome != 'incomplete'
-              AND start_time >= ?
-              AND turn_count >= ?
-              AND tool_execution_count >= ?
-              AND opval_enabled = 1
-            """,
-            (since, min_turns, min_tool_executions),
+        """Return RG01-eligible sessions within window with required evidence.
+
+        synthetic: 0 = real only (default, preserves RG01 real-session
+        semantics), 1 = synthetic only, None = both.
+        """
+        query = (
+            "SELECT * FROM opval_sessions "
+            "WHERE outcome != 'incomplete' AND start_time >= ? "
+            "AND turn_count >= ? AND tool_execution_count >= ? "
+            "AND opval_enabled = 1"
         )
+        params: List[Any] = [since, min_turns, min_tool_executions]
+        if synthetic is not None:
+            query += " AND synthetic = ?"
+            params.append(synthetic)
+        cur = self._conn.execute(query, params)
         sessions = [dict(r) for r in cur.fetchall()]
         if state_db_conn is not None:
             sids = [s["session_id"] for s in sessions]
@@ -451,9 +455,8 @@ class OpvalStore:
             min_turns=min_turns or 0,
             min_tool_executions=min_tool_executions or 0,
             state_db_conn=state_db_conn,
+            synthetic=synthetic,
         )
-        if synthetic is not None:
-            eligible = [s for s in eligible if s.get("synthetic") == synthetic]
         if domain is not None:
             eligible = [s for s in eligible if s.get("primary_domain") == domain]
         return len({s.get("root_session_id") or s["session_id"] for s in eligible})
