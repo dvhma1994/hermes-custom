@@ -70,13 +70,21 @@ class StrategyEffectivenessManager:
                 "avg_drift": 0.0,
             }
 
-        total = len(observations)
-        wins = sum(1 for o in observations if o.get("outcome") == lc.FEEDBACK_OUTCOME_SUCCESS)
+        # win_rate / sample_count / score reflect per-SESSION outcomes only. The
+        # evidence builder also emits turn-level 'recovery' observations for failing
+        # turns; counting those as samples deflated win_rate and wrongly RETIRED
+        # strategies whose sessions all succeeded (and blocked legitimate promotion).
+        session_obs = [o for o in observations if o.get("evidence_type") != "recovery"]
+        if not session_obs:
+            return {"sample_count": 0, "win_rate": 0.0, "avg_score": 0.0,
+                    "avg_alignment": 0.0, "avg_drift": 0.0}
+        total = len(session_obs)
+        wins = sum(1 for o in session_obs if o.get("outcome") == lc.FEEDBACK_OUTCOME_SUCCESS)
         scores: List[float] = []
         alignments: List[float] = []
         drifts: List[float] = []
 
-        for obs in observations:
+        for obs in session_obs:
             payload = self._parse_payload(obs.get("payload_json", "{}"))
             # Prefer an explicit promotion score; otherwise derive a quality
             # signal from the session-level aggregates. promotion_score is often

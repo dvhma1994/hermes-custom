@@ -99,10 +99,11 @@ def test_effectiveness_win_rate_threshold(tmp_path):
     _obs_for_session(store, str(uuid.uuid4()), outcome="failure", score=0.3)
     sem = StrategyEffectivenessManager(store._conn)
     result = sem.evaluate("strategy:coding")
-    # failure session creates a recovery observation too, so 4 total
-    assert result.sample_count == 4
-    # 2 success + 2 failure = win_rate 0.5
-    assert result.win_rate == pytest.approx(0.5, abs=0.01)
+    # per-session counting: 3 sessions are the samples; the failure session's
+    # turn-level 'recovery' observation is NOT a sample (it deflated win_rate).
+    assert result.sample_count == 3
+    # 2 success / 3 sessions = win_rate 0.667, still below the 0.75 threshold
+    assert result.win_rate == pytest.approx(2 / 3, abs=0.01)
     assert result.win_rate < lc.EFFECTIVENESS_WIN_RATE_THRESHOLD
     assert not result.promotion_eligible
 
@@ -154,8 +155,9 @@ def test_effectiveness_retirement_eligibility(tmp_path):
         _obs_for_session(store, str(uuid.uuid4()), outcome="failure", score=0.3)
     sem = StrategyEffectivenessManager(store._conn)
     result = sem.evaluate("strategy:coding")
-    # 3 failure sessions each produce session+recovery = 6 observations
-    assert result.sample_count == 6
+    # per-session counting: 3 failure sessions = 3 samples (turn-level recovery
+    # observations are supplementary signal, not counted as samples)
+    assert result.sample_count == 3
     assert result.win_rate == 0.0
     assert result.win_rate <= lc.RETIREMENT_WIN_RATE
     assert result.retirement_eligible
