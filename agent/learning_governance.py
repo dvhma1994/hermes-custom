@@ -180,7 +180,7 @@ class LearningGovernance:
             """
             SELECT * FROM learning_governance_events
             WHERE strategy_id=?
-            ORDER BY created_at ASC, event_id ASC
+            ORDER BY created_at ASC, rowid ASC
             """,
             (strategy_id,),
         )
@@ -307,7 +307,7 @@ class LearningGovernance:
 
     def _last_hash(self, strategy_id: str) -> Optional[str]:
         cur = self._conn.execute(
-            "SELECT source_hash FROM learning_governance_events WHERE strategy_id=? ORDER BY created_at DESC, event_id DESC LIMIT 1",
+            "SELECT source_hash FROM learning_governance_events WHERE strategy_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (strategy_id,),
         )
         row = cur.fetchone()

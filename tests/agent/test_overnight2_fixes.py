@@ -32,3 +32,26 @@ def test_recovery_observations_not_counted_as_samples():
     assert m["win_rate"] == 1.0              # all sessions succeeded; not 0.33
     # therefore NOT retirement-eligible (0.33 would have been <= RETIREMENT_WIN_RATE)
     assert m["win_rate"] > lc.RETIREMENT_WIN_RATE
+
+
+# ── Bug #2: governance hash-chain forked when two events shared created_at, so
+# verify_chain() returned False on the engine's OWN untampered chain (and stuck
+# the circuit breaker in DEGRADED). Ordering by rowid (insertion order) fixes it. ──
+def test_governance_chain_stable_under_equal_timestamps():
+    import agent.learning_governance as g
+    import agent.learning_constants as lc
+    from agent.opval.store import OpvalStore
+
+    g.LearningGovernance._now = staticmethod(lambda: 1781990000.0)  # force identical created_at
+    gov = g.LearningGovernance(OpvalStore(":memory:")._conn)
+    ad = g.AuthorityDecision(policy=lc.AUTHORITY_POLICY_STRICT)
+    for i in range(6):
+        gov.enforce_policy("s", ad, f"r{i}")
+    assert gov.verify_chain("s") is True            # untampered chain must verify
+    # tamper detection must still work
+    gov._conn.execute(
+        "UPDATE learning_governance_events SET source_hash='deadbeef' "
+        "WHERE strategy_id='s' AND rowid=(SELECT MIN(rowid)+1 FROM "
+        "learning_governance_events WHERE strategy_id='s')"
+    )
+    assert gov.verify_chain("s") is False
