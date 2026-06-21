@@ -48,7 +48,7 @@ class LearningMirrorCircuitBreaker:
     # ──────────────────────────────
 
     def is_degraded(self, now: Optional[float] = None) -> bool:
-        now = now or time.time()
+        now = time.time() if now is None else now
         state = self._current_state()
         if state is None or state.state != lc.CIRCUIT_BREAKER_STATE_DEGRADED:
             return False
@@ -59,7 +59,7 @@ class LearningMirrorCircuitBreaker:
 
     def activate(self, reason: str, now: Optional[float] = None) -> CircuitBreakerState:
         """Activate degraded mode. Idempotent if already degraded."""
-        now = now or time.time()
+        now = time.time() if now is None else now
         current = self._current_state()
         if current is not None and current.state == lc.CIRCUIT_BREAKER_STATE_DEGRADED:
             return current
@@ -87,7 +87,7 @@ class LearningMirrorCircuitBreaker:
         the governance event chain fails integrity replay — restoring on a
         tampered/broken chain would re-enable promotions on untrustworthy state.
         """
-        now = now or time.time()
+        now = time.time() if now is None else now
         current = self._current_state()
         if current is None or current.state != lc.CIRCUIT_BREAKER_STATE_DEGRADED:
             return None
@@ -116,7 +116,7 @@ class LearningMirrorCircuitBreaker:
 
     def forced_refreeze_status(self, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """Return status of forced refreeze if expired."""
-        now = now or time.time()
+        now = time.time() if now is None else now
         state = self._current_state()
         if state is None or state.state != lc.CIRCUIT_BREAKER_STATE_DEGRADED:
             return None

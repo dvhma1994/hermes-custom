@@ -81,3 +81,29 @@ def test_session_reset_policy_coerces_and_handles_string_exclude():
     assert p.idle_minutes == 30 and isinstance(p.idle_minutes, int)
     assert p.notify_exclude_platforms == ("api_server",)   # one platform, not chars
     assert SessionResetPolicy.from_dict({"at_hour": "oops"}).at_hour == 4   # bad -> default
+
+
+# ── Bug #9: allow_self_delegate=True silently re-enabled self-delegation even when
+# the policy forbade it (no_self_delegate). More-restrictive must win. ───────────
+def test_no_self_delegate_policy_not_clobbered_by_allow_true():
+    import agent.runtime_authority as ra
+
+    class _A:
+        pass
+
+    a = _A()
+    ra.apply_decision(a, ra.AuthorityDecision(
+        policy=ra.AUTHORITY_POLICY_NO_SELF_DELEGATE, allow_self_delegate=True))
+    assert a._authority_delegation_policy == ra.AUTHORITY_POLICY_NO_SELF_DELEGATE
+    # explicit deny still restricts under a permissive policy
+    b = _A()
+    ra.apply_decision(b, ra.AuthorityDecision(
+        policy=ra.AUTHORITY_POLICY_PERMISSIVE, allow_self_delegate=False))
+    assert b._authority_delegation_policy == ra.AUTHORITY_POLICY_NO_SELF_DELEGATE
+
+
+# ── Bug #14: filter_tool_scope crashed on a tool dict whose 'function' is None. ──
+def test_filter_tool_scope_handles_none_function():
+    import agent.runtime_authority as ra
+    kept = ra.filter_tool_scope([{"function": None, "name": "mytool"}], frozenset({"mytool"}))
+    assert len(kept) == 1

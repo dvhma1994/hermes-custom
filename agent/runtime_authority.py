@@ -174,13 +174,17 @@ def apply_decision(agent: Any, decision: AuthorityDecision) -> None:
     if value is not None:
         agent._authority_context_size_override = value
 
-    # Self-delegation
+    # Self-delegation. The more restrictive setting wins: an explicit deny always
+    # restricts, but allow_self_delegate=True must NOT re-enable self-delegation
+    # when the policy above already forbade it (no_self_delegate). Otherwise a
+    # default-True allow_self_delegate silently defeats a no_self_delegate policy.
     value = decision.allow_self_delegate
     if value is not None:
-        agent._authority_delegation_policy = (
-            AUTHORITY_POLICY_NO_SELF_DELEGATE if not value else AUTHORITY_POLICY_PERMISSIVE
-        )
         agent._authority_allow_self_delegate = value
+        if not value:
+            agent._authority_delegation_policy = AUTHORITY_POLICY_NO_SELF_DELEGATE
+        elif getattr(agent, "_authority_delegation_policy", None) != AUTHORITY_POLICY_NO_SELF_DELEGATE:
+            agent._authority_delegation_policy = AUTHORITY_POLICY_PERMISSIVE
 
     # Max tool iterations
     value = decision.max_tool_iterations
@@ -241,7 +245,10 @@ def filter_tool_scope(tools_for_api: list, scope: frozenset) -> list:
     def _tool_name(tool: Any) -> Optional[str]:
         if isinstance(tool, dict):
             return (
-                tool.get("function", {}).get("name")
+                # `function` may be present-but-None; .get("function", {}) only
+                # defaults on a MISSING key, so guard with `or {}`, then fall back
+                # to the top-level name.
+                (tool.get("function") or {}).get("name")
                 or tool.get("name")
             )
         fn = getattr(tool, "function", None)
