@@ -25,13 +25,58 @@ OPVAL telemetry ──▶ observations ──▶ effectiveness ──▶ governa
 - Entirely **flag-gated**: a complete no-op (no DB touch) unless `HERMES_LEARNING=1`. `HERMES_OPVAL=1`
   collects the telemetry that feeds it.
 
-**Critical fix that made it actually work:** `agent/opval/store.py` ran `CREATE INDEX` on new columns
-*before* the additive column migrations, and `_MIGRATIONS` was missing 4 columns — so on any
+**Critical fix #1 — telemetry was silently dead:** `agent/opval/store.py` ran `CREATE INDEX` on new
+columns *before* the additive column migrations, and `_MIGRATIONS` was missing 4 columns — so on any
 pre-existing `state.db`, `OpvalStore` raised `no such column` and OPVAL recording silently died,
 starving the loop. Fixed: migrations are now table-aware and run **before** the schema script, plus
 the 4 missing column migrations were added. Telemetry records again; the loop has data.
 
-## 2. Hardening fixes
+**Critical fix #2 — promotion was mathematically impossible:** the collectors store
+`drift_pct`/`misalignment_pct` on a **0–100 percent** scale, but `strategy_effectiveness_manager`
+compared them as **0–1 fractions** — so `avg_alignment` collapsed to 0 on *any* misaligned turn (vs the
+65 gate) and `avg_drift` was ~100× inflated (vs the 0.15 gate). No strategy could *ever* be promoted;
+the signal was a flat, degenerate constant. Fixed the units (`alignment = 100 − misalignment_pct`,
+`drift = drift_pct / 100`); a clean high-win-rate strategy now actually promotes. Two related signal
+fixes landed too: readiness no longer aggregates over **all** sessions when the eligible set is empty
+(`1=1` → `0=1`), and `is_drift_alert` is now read-only so polling no longer drags the averaged baseline
+toward the current value and self-extinguishes a real drift. **The loop can now show measurable
+self-improvement** — the gradient that was missing.
+
+## 2. Hardening fixes — 53 verified bugs, DoD-gated
+
+Found via parallel adversarial bug-hunts (read-only finders → independent verifiers that reproduce
+each candidate against the live code), then fixed one at a time under a strict gate: **each fix has a
+regression test that fails on the old code and passes on the new**, and the affected subsystem's
+existing suite stays green. Regression suites live in `tests/agent/test_overnight2_fixes.py` and
+`tests/agent/test_hunt3_fixes.py`. 12 of the fixes were delegated to the agent itself (engineer role)
+and independently audited.
+
+**Security (4):**
+- Hardline command floor (`rm -rf /`, `dd` to a raw device, `shutdown`) was **bypassable by quoting**
+  the path/command word (`rm -rf "/"`); the detector normalizer only stripped *empty* quote pairs.
+- The dangerous-command guard consulted only the **first** matching pattern, so a session approval of
+  one common op (e.g. "recursive delete") silently authorized a *different* destructive op bundled into
+  the same command (`rm -rf x && git push --force`). Now keyed on the pattern **combination**.
+- **Path traversal** in transcript cleanup: an unvalidated `session_id` (`../…`) could delete files
+  outside the sessions dir. Now rejected + containment-checked.
+- **Cross-profile credential leak**: dashboard env writes scoped to *another* profile still mutated the
+  running process's shared `os.environ`, clobbering live credentials. Now gated to the active profile.
+
+**Data integrity & correctness:** SQLite success decided from a statement's `rowcount` (not the
+connection's cumulative `total_changes`); governance hash-chain ordered by insertion (no fork on equal
+timestamps); conversation replay ordered by id, not wall-clock (survives a clock regression); memory
+entries reject the on-disk delimiter (no silent entry-splitting) and keep live state on drift; Bedrock
+images decoded (were double-base64'd); a tool result for a Codex-shape `call_id` tool-call no longer
+dropped.
+
+**Crash guards** across the turn loop, tool executor, compression, providers, and every gateway
+adapter — null/non-string error fields, non-dict tool args, unknown email charsets, impossible-but-valid
+cron expressions (`0 9 31 2 *` = Feb 31, which used to crash the **entire** scheduler tick), and more —
+now degrade gracefully instead of aborting the turn / tick / poll batch.
+
+**Formatting fidelity:** Slack/Telegram/WhatsApp/Signal message rendering (link-label escaping, URL
+parens, UTF-16 mention offsets, header bold, UUID mentions) and the rate-limit "resets in 2h30m"
+parser.
 
 - **Backup retention** (`hermes_state_backup.py`): hot/repair/daily `state.db` snapshots are now
   capped by **count *and* age**, and the `repair/` tier — which was **never pruned** — is cleaned.
