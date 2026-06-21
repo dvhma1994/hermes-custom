@@ -31,6 +31,27 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ---
 
+## ⚡ This is a customized build
+
+A personalized fork of Hermes with a working self-improvement loop, hardening fixes, and a tuned
+operating doctrine. Installs/runs exactly like upstream. **Full details → [README_CUSTOM.md](README_CUSTOM.md).**
+
+- **Self-learning loop, live & wired** — OPVAL telemetry → learning cycle → hash-chained governance →
+  applied authority (flag-gated by `HERMES_LEARNING=1`). Upstream shipped this as dead code; here it's
+  integrated end-to-end, plus a fix that restored the telemetry recording that feeds it.
+- **Hardening** — `state.db` backup retention (caps hot/repair/daily by count + age; prunes the
+  `repair/` tier that was never cleaned and had grown to ~190 GB).
+- **Tuned default SOUL** — internal thinking protocol, a Definition-of-Done self-verification gate,
+  scope-before-start decomposition, and an output-craft standard.
+- **14 bundled skills** — deep-verify, scout, orchestrate, autonomous-auditor, claim-verify, and more.
+- **Validated** — under the DoD doctrine the agent's self-verified output held up to independent blind
+  audit: **111/111** hidden tests on bounded tasks; **12/12** planted bugs found with **0 fabrications**
+  on open-ended audits.
+
+> Setup: `cp .env.example .env`, add your keys, then set `HERMES_OPVAL=1` + `HERMES_LEARNING=1`.
+
+---
+
 ## Quick Install
 
 ### Linux, macOS, WSL2, Termux
