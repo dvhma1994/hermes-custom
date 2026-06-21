@@ -55,3 +55,17 @@ def test_governance_chain_stable_under_equal_timestamps():
         "learning_governance_events WHERE strategy_id='s')"
     )
     assert gov.verify_chain("s") is False
+
+
+# ── Bug #17: fallback chunk-split used the UTF-16 unit limit as a codepoint slice
+# index, so emoji/CJK chunks could be ~2x the platform limit. ──────────────────
+def test_split_text_chunks_respects_utf16_limit_for_wide_chars():
+    from gateway.stream_consumer import GatewayStreamConsumer
+    from gateway.platforms.base import utf16_len
+    split = GatewayStreamConsumer._split_text_chunks
+    text = "\U0001F4A5" * 350          # 350 emoji, each 2 UTF-16 units, no newlines
+    chunks = split(text, 100, len_fn=utf16_len)
+    assert all(utf16_len(c) <= 100 for c in chunks)   # was ~200 before the fix
+    assert "".join(chunks) == text                    # no data lost
+    # ASCII path (len_fn=len) unchanged
+    assert all(len(c) <= 100 for c in split("a" * 250, 100))
