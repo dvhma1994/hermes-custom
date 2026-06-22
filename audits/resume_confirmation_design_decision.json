@@ -1,0 +1,54 @@
+{
+  "document": "resume_confirmation_design_decision",
+  "generated_at": "2026-06-16T21:19:32Z",
+  "options": {
+    "A": {
+      "name": "Informational prompt only",
+      "description": "Keep current auto-resume behavior on continuation keywords. Remove wording that asks user to reply 'yes'. Treat prompt as a status notification.",
+      "complexity": "LOW",
+      "files_to_modify": [
+        "gateway/run.py - _resolve_resume_checkpoint_decision: simplify prompt text, keep keyword heuristic",
+        "agent/turn_context.py - no changes needed",
+        "agent/conversation_loop.py - no changes needed"
+      ],
+      "backward_compatibility": "HIGH - existing behavior preserved; only prompt wording changes.",
+      "risks": [
+        "Users may still misinterpret the prompt if wording not fully neutral.",
+        "Does not satisfy the explicit-confirmation requirement stated by the user."
+      ]
+    },
+    "B": {
+      "name": "Strict confirmation flow",
+      "description": "When a checkpoint exists and the incoming message is not an explicit confirmation, display the prompt, record a pending-confirmation state, and do NOT start the agent. The next incoming message resolves the pending state: 'yes' triggers resume, anything else starts fresh and clears the checkpoint.",
+      "complexity": "MEDIUM",
+      "files_to_modify": [
+        "gateway/run.py - GatewayRunner.__init__: add self._pending_resume_confirmation dict",
+        "gateway/run.py - _resolve_resume_checkpoint_decision: split into (a) detect-and-prompt returning 'awaiting_confirmation', (b) resolve-pending-state on next message",
+        "gateway/run.py - message handler: gate agent.run_conversation when a pending confirmation exists; consume confirmation reply first",
+        "agent/turn_context.py - build_turn_context: handle resume_checkpoint_decision='awaiting_confirmation' or ensure no resume occurs until explicit",
+        "agent/execution_checkpoint.py: optional helper to mark/validate confirmation",
+        "hermes_state.py: optional pending_resume_checkpoints table or in-memory only (in-memory sufficient per gateway instance)"
+      ],
+      "backward_compatibility": "MODERATE - users typing 'continue' without 'yes' will no longer auto-resume; this matches the prompt but breaks prior muscle memory.",
+      "risks": [
+        "Gateway restart while pending loses state (unless persisted; persistence adds complexity).",
+        "Session lock / busy handling must not block confirmation message.",
+        "A stray unrelated message could clear checkpoint if user sends it by accident while pending.",
+        "Needs careful handling of /stop, /queue, and control commands while pending."
+      ]
+    }
+  },
+  "analysis": {
+    "current_behavior": "The resume prompt asks for explicit 'yes' but auto-resumes on 'continue'/'resume' keywords. This is internally inconsistent.",
+    "user_requirement": "Demonstrated expectation: continue -> prompt -> explicit yes -> resume. No keyword-fallback dependency.",
+    "state_required": "A per-session pending-confirmation state must be introduced. No such state exists today.",
+    "persistence": "In-memory state is enough for MVP; persisting pending state across gateway restart is optional and increases complexity."
+  },
+  "recommendation": "Option B - Strict confirmation flow",
+  "rationale": [
+    "The current prompt text already promises explicit confirmation, so the implementation should honor it.",
+    "Option B is the only path that satisfies the user's stated validation requirement (no keyword-fallback dependency).",
+    "Complexity is manageable because it is localized to the gateway message handler and resume-decision method.",
+    "The main risk (gateway restart losing pending state) can be mitigated by a short-lived pending state and a clear prompt re-send on restart."
+  ]
+}

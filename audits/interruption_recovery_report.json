@@ -1,0 +1,36 @@
+{
+  "observed_behavior": "Telegram interruption reported 'Interrupting current task' but task never resumed from execution state.",
+  "root_cause": "Hermes is turn-oriented, not task-oriented. A Telegram interrupt ends the turn and only the transcript is persisted; in-flight execution state (counters, todo, pending tool calls) is lost.",
+  "what_survives": {
+    "execution_state": "lost (reconstructed from transcript only)",
+    "todo_state": "partially reconstructed from last todo tool response in history",
+    "tool_state": "lost; cancelled calls recorded as skipped tool results, pending calls vanish",
+    "file_modifications": "persisted (filesystem), but agent forgets it made them",
+    "iteration_count": "lost",
+    "reasoning_context": "partially persisted as transcript; compressed sessions lose detail"
+  },
+  "what_now_persists": {
+    "execution_state": "persisted",
+    "todo_state": "persisted",
+    "tool_state": "persisted",
+    "file_modifications": "not tracked by checkpoint (intentional)",
+    "iteration_count": "persisted",
+    "reasoning_context": "persisted via message snapshot + resume injection"
+  },
+  "verification": {
+    "compile_all_modified_files": "PASSED",
+    "import_modified_modules": "PASSED",
+    "checkpoint_roundtrip_via_session_db": "PASSED",
+    "turn_context_resume_synthetic_test": "PASSED",
+    "test_turn_context_pytest": "8 passed",
+    "test_hermes_state_pytest": "267 passed",
+    "live_gateway_telegram": "BLOCKED"
+  },
+  "live_gateway_validation": {
+    "status": "BLOCKED",
+    "blocker": "Cannot programmatically send a user-originated Telegram message; bot API sendMessage does not create a bot-side update.",
+    "gateway_pid": 73788,
+    "patches_loaded_at": "2026-06-16 22:24:31",
+    "evidence_file": "C:\\Users\\ZpLp\\AppData\\Local\\hermes\\hermes-agent\\audits\\real_runtime_validation_report.json"
+  }
+}

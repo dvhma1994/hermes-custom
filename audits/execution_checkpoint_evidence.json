@@ -1,0 +1,48 @@
+{
+  "validation_phase": "failure_investigation",
+  "timestamp": "2026-06-16T20:08:20Z",
+  "observed_behavior": {
+    "task_started": true,
+    "interrupted_via_telegram": "/stop at 2026-06-16 22:51:16",
+    "hermes_replied": "Stopped. You can continue this session.",
+    "continue_message_received": "2026-06-16 22:51:32 msg='continue'",
+    "resume_prompt_shown": false,
+    "task_restarted_from_beginning": true
+  },
+  "database_evidence": {
+    "execution_checkpoints_rows": 0,
+    "state_db_path": "C:\\Users\\ZpLp\\AppData\\Local\\hermes\\state.db",
+    "conclusion": "No checkpoint row was written for the interrupted dashboard task session 20260616_212538_d85457."
+  },
+  "call_path_evidence": {
+    "checkpoint_capture_function": "_capture_execution_checkpoint (conversation_loop.py:82)",
+    "checkpoint_save_function": "db.save_execution_checkpoint (via _capture_execution_checkpoint)",
+    "checkpoint_save_invoked": false,
+    "save_logs_emitted": null
+  },
+  "log_evidence": {
+    "agent_log_turn_end": "2026-06-16 22:51:16,803 INFO [20260616_212538_d85457] agent.conversation_loop: Turn ended: reason=interrupted_during_api_call model=kimi-k2.7-code api_calls=1/150 budget=1/150 tool_turns=53",
+    "gateway_log_resume_error": "2026-06-16 22:51:32,250 WARNING [20260616_212538_d85457] gateway.run: Resume decision resolution failed: 'GatewayRunner' object has no attribute '_resolve_resume_checkpoint_decision'",
+    "gateway_log_attribute_error": "AttributeError: 'GatewayRunner' object has no attribute '_resolve_resume_checkpoint_decision' at gateway/run.py line 15249 in run_sync",
+    "gateway_log_stop_command": "2026-06-16 22:51:16,778 INFO gateway.run: Invalidated run generation for agent:main:telegram:dm:5357755919 → 2 (stop_command)",
+    "checkpoint_save_log": null,
+    "checkpoint_load_log": null,
+    "checkpoint_resume_log": null,
+    "checkpoint_delete_log": null
+  },
+  "failure_points": {
+    "failure_1": {
+      "location": "agent/conversation_loop.py line 3693",
+      "description": "When an interrupt arrives during an active model API call, the loop sets _turn_exit_reason='interrupted_during_api_call' and breaks WITHOUT calling _capture_execution_checkpoint.",
+      "evidence": "agent.log line 21453: 'Turn ended: reason=interrupted_during_api_call' with no following 'Execution checkpoint saved' log; execution_checkpoints table is empty.",
+      "impact": "No checkpoint is persisted, so resuming the task is impossible regardless of the gateway resume path."
+    },
+    "failure_2": {
+      "location": "gateway/run.py",
+      "description": "_resolve_resume_checkpoint_decision() is defined at module level (between helper functions before class GatewayRunner), so GatewayRunner instances do not have it as a method.",
+      "evidence": "gateway.log/agent.log: AttributeError: 'GatewayRunner' object has no attribute '_resolve_resume_checkpoint_decision' at run.py:15249 in run_sync.",
+      "impact": "Even if a checkpoint existed, the resume prompt code is unreachable and falls through to normal turn handling, causing the task to restart from the beginning."
+    }
+  },
+  "root_cause_summary": "Two independent defects prevented the E2E resume flow: (1) the checkpoint save hook is missing for the 'interrupted_during_api_call' path, so no row is written; (2) the gateway resume decision method is incorrectly placed at module scope instead of inside GatewayRunner, so the resume prompt never executes."
+}

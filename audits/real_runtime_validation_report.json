@@ -1,0 +1,31 @@
+{
+  "validation_date": "2026-06-16T20:23:45Z",
+  "gateway_status": "single patched process via Scheduled Task (PID 17700)",
+  "test_scenario": "Wait for real Telegram user message with dashboard redesign task, then interrupt, resume, and verify checkpoint lifecycle.",
+  "step_results": {
+    "1_start_hermes": "DONE - PID 17700 started at 2026-06-16 23:13:38",
+    "2_wait_for_user_message": "DONE - user sent dashboard task at 2026-06-16 23:20:01",
+    "3_confirm_checkpoint_save": "PASSED - checkpoint saved at 23:20:12 reason=interrupted_during_api_call",
+    "4_interrupt_from_telegram": "DONE - /stop command at 2026-06-16 23:20:12",
+    "5_confirm_checkpoint_row": "PASSED - execution_checkpoints has 1 row for task 20260616_212538_d85457",
+    "6_reconnect_telegram": "DONE",
+    "7_resume_prompt": "PARTIAL - prompt send failed due to missing event loop, but fallback keyword heuristic returned resume",
+    "8_select_resume": "PASSED - auto-resume selected via continuation keyword",
+    "9_verify_state_restored": "PASSED - same session_id, api_call_count=1 restored, tools continued (todo, execute_code)",
+    "10_complete_task": "NOT_REACHED - user sent second /stop at 23:21:07 before completion",
+    "11_verify_checkpoint_deletion": "NOT_REACHED - checkpoint still present because task did not complete"
+  },
+  "observed_state": {
+    "checkpoint_task_id": "20260616_212538_d85457",
+    "checkpoint_session_id": "20260616_212538_d85457",
+    "checkpoint_api_call_count": 1,
+    "resumed_session_id": "20260616_212538_d85457",
+    "resumed_api_call_count": 1,
+    "tools_after_resume": [
+      "todo",
+      "execute_code"
+    ],
+    "task_restarted": false
+  },
+  "pending_action": "Allow the dashboard task to run to completion to collect checkpoint deletion evidence, or start a fresh controlled E2E run."
+}

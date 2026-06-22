@@ -1,0 +1,17 @@
+{
+  "report_type": "resume_confirmation_restart_validation",
+  "timestamp": "2026-06-16T21:45:54Z",
+  "status": "complete",
+  "flow_C_verdict": "PASS",
+  "db_counts_before_restart": {
+    "execution_checkpoints": 2,
+    "pending_resume_checkpoints": 1
+  },
+  "db_counts_after_restart": {
+    "execution_checkpoints": 2,
+    "pending_resume_checkpoints": 1
+  },
+  "pending_confirmed_after_restart": false,
+  "decision_after_restart_yes": "resume",
+  "verdict": "PASS"
+}

@@ -1,0 +1,7 @@
+{
+  "status": "PENDING",
+  "note": "Full lifecycle validation in progress. Evidence will be collected once the user sends the dashboard task, interrupts, resumes via the prompt, and allows completion.",
+  "gateway_pid": 70572,
+  "gateway_start": "2026-06-16 23:30:17",
+  "generated_at": "2026-06-16T20:36:59Z"
+}

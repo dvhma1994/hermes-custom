@@ -1,0 +1,46 @@
+{
+  "report_type": "resume_confirmation_investigation",
+  "generated_at": "2026-06-16T20:55:17Z",
+  "observed_behavior": {
+    "user_message": "continue",
+    "resume_prompt": "displayed (send path fixed)",
+    "execution": "resumed immediately without waiting for explicit 'yes'"
+  },
+  "root_cause": {
+    "summary": "The resume-decision pipeline has no pending-confirmation state. The prompt is informational; the method always returns a decision immediately based on heuristics.",
+    "code_paths": [
+      {
+        "file": "gateway/run.py",
+        "method": "GatewayRunner._resolve_resume_checkpoint_decision",
+        "behavior": [
+          "Sends a resume prompt to the user.",
+          "Classifies the incoming message via classify_task().",
+          "If classification matches checkpoint.task_classification, returns 'resume' immediately.",
+          "Otherwise checks continuation keywords ('yes','continue','resume','finish','proceed','go on') and returns 'resume' if any match.",
+          "Only returns 'ignore' if the message is unrelated."
+        ]
+      },
+      {
+        "file": "agent/turn_context.py",
+        "method": "build_turn_context",
+        "behavior": [
+          "If resume_checkpoint_decision is 'resume', unconditionally resumes.",
+          "If decision is None, calls _task_looks_like_continuation(), which also returns True for matching classification or continuation keywords.",
+          "There is no branch that defers execution to wait for a user reply."
+        ]
+      }
+    ]
+  },
+  "evidence": {
+    "gateway_log_line_964": "2026-06-16 23:47:16,782 INFO gateway.run: Resuming checkpoint for task=20260616_212538_d85457 (continuation keyword)",
+    "continuation_keyword_match": "'continue' is in the hard-coded keyword list",
+    "classification_match": "classify_task('continue') may equal checkpoint.task_classification or be general, but keyword fallback still triggers",
+    "no_pending_state": "Search for pending_resume / await_reply / resume_state returned 0 matches in gateway/run.py"
+  },
+  "design_assessment": {
+    "current_intent": "The implementation intentionally auto-resumes when the incoming message looks like a continuation, using the prompt only as a non-blocking notification.",
+    "user_intent": "Prompt should be a blocking confirmation gate: wait for explicit 'yes' before resuming.",
+    "classification": "BUG relative to intended resume-confirmation design. The current design does not implement the explicit confirmation state it implies in the prompt text."
+  },
+  "conclusion": "Execution resumed before explicit confirmation because the keyword heuristic in _resolve_resume_checkpoint_decision returns 'resume' for the word 'continue', and build_turn_context honors that decision immediately. There is no persisted or in-memory state that pauses the run to await a confirmation reply. The resume prompt is currently informational-only."
+}

@@ -1,0 +1,28 @@
+{
+  "design_name": "Persistent Execution Checkpoints",
+  "components": {
+    "agent/execution_checkpoint.py": "Typed dataclass + JSON serialization",
+    "hermes_state.py": "execution_checkpoints schema + save/load/delete/list/prune",
+    "agent/conversation_loop.py": "_capture_execution_checkpoint + _delete_execution_checkpoint hooks",
+    "agent/tool_executor.py": "_capture_tool_executor_checkpoint on batch cancellation",
+    "agent/turn_context.py": "_checkpoint_for_task + _resume_from_checkpoint integration in build_turn_context",
+    "run_agent.py": "forward resume_checkpoint_decision kwarg",
+    "gateway/run.py": "_resolve_resume_checkpoint_decision prompt + heuristic"
+  },
+  "behavior": {
+    "on_interrupt": "Save checkpoint to state.db with counters, todo snapshot, pending tools, message snapshot.",
+    "on_next_message": "Gateway detects checkpoint, prompts user, decides resume/ignore, passes decision to run_conversation.",
+    "on_resume": "turn_context restores counters/todo, injects resume note + pending tool_calls assistant message, persists resumed messages.",
+    "on_completion": "conversation_loop deletes checkpoint so it is not reloaded."
+  },
+  "future_improvements": [
+    "Synchronous user confirmation instead of heuristic (requires gateway clarify integration).",
+    "Persist file-level checksums or operation log for idempotent file work.",
+    "Compress old checkpoints and keep longer history."
+  ],
+  "constraints": {
+    "no_evolution_engine": true,
+    "no_self_modification": true,
+    "no_autonomous_coding": true
+  }
+}
