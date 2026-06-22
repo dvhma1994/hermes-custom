@@ -1,0 +1,3 @@
+The read_file mtime dedup is confirmed (file_tools.py:489-505 and surrounding). The strategy-id derivation `strategy:{primary_domain}` at learning_evidence_builder.py:127 vs the constructor strictness at strategic_learning.py:114-115 is confirmed — though note the synthesis cited `primary_domain` derivation correctly. Minor: synthesis said "strategy_id" line 127 derives `strategy:{domain}` — the actual key is `primary_domain`. Close enough.
+
+I have enough to write the verification report. Let me do one final check on the RT-01 dormancy claim and the audit overstatement since those are cited specifically.
