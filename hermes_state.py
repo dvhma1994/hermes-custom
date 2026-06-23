@@ -1,0 +1,6252 @@
+#!/usr/bin/env python3
+"""
+SQLite State Store for Hermes Agent.
+
+Provides persistent session storage with FTS5 full-text search, replacing
+the per-session JSONL file approach. Stores session metadata, full message
+history, and model configuration for CLI and gateway sessions.
+
+Key design decisions:
+- WAL mode for concurrent readers + one writer (gateway multi-platform)
+- FTS5 virtual table for fast text search across all session messages
+- Compression-triggered session splitting via parent_session_id chains
+- Batch runner and RL trajectories are NOT stored here (separate systems)
+- Session source tagging ('cli', 'telegram', 'discord', etc.) for filtering
+"""
+
+import datetime
+import hashlib
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import sqlite3
+import threading
+import time
+from pathlib import Path
+
+from agent.memory_manager import sanitize_context
+from hermes_constants import get_hermes_home
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
+
+from hermes_state_backup import (
+    SafeModeState,
+    StartupIntegrityValidator,
+    StateDBBackupManager,
+    validate_backup,
+)
+from hermes_state_migration import RT01MigrationEngine, MigrationState
+
+logger = logging.getLogger(__name__)
+
+def _delegate_from_json(col: str = "model_config") -> str:
+    return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
+
+
+# A child session counts as a /branch (kept visible, never cascade-deleted) if
+# it carries the stable marker OR the legacy end_reason heuristic holds.
+_BRANCH_CHILD_SQL = (
+    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._branched_from') IS NOT NULL"
+    " OR EXISTS (SELECT 1 FROM sessions p"
+    "            WHERE p.id = {a}.parent_session_id"
+    "            AND p.end_reason = 'branched'"
+    "            AND {a}.started_at >= p.ended_at)"
+)
+
+_COMPRESSION_CHILD_SQL = (
+    "EXISTS (SELECT 1 FROM sessions p"
+    "        WHERE p.id = {a}.parent_session_id"
+    "        AND p.end_reason = 'compression'"
+    "        AND {a}.started_at >= p.ended_at)"
+)
+
+# Rows that surface in pickers: roots + branch children (subagent runs and
+# compression continuations stay hidden).
+_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+
+
+def _ephemeral_child_sql(alias: str = "s") -> str:
+    """Subagent runs (cascade-delete targets), not branches or compression tips."""
+    branch = _BRANCH_CHILD_SQL.format(a=alias)
+    compression = _COMPRESSION_CHILD_SQL.format(a=alias)
+    return (
+        f"({alias}.parent_session_id IS NOT NULL"
+        f" AND NOT ({branch})"
+        f" AND NOT ({compression}))"
+    )
+
+
+def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
+    """Delegate-subagent ids to cascade-delete with *parent_ids*.
+
+    Only rows carrying the ``_delegate_from`` marker (set at creation, and
+    backfilled by the v16 migration) — generic untagged children keep the
+    orphan-don't-delete contract. Walks marker chains recursively so an
+    orchestrator subagent's own delegate children go too (FK safety).
+    """
+    df = _delegate_from_json()
+    found: set[str] = set()
+    frontier = [sid for sid in parent_ids if sid]
+    while frontier:
+        ph = ",".join("?" * len(frontier))
+        cursor = conn.execute(
+            f"SELECT id FROM sessions WHERE {df} IN ({ph}) "
+            f"OR (parent_session_id IN ({ph}) AND {df} IS NOT NULL)",
+            frontier + frontier,
+        )
+        frontier = [row["id"] for row in cursor.fetchall() if row["id"] not in found]
+        found.update(frontier)
+    return list(found)
+
+
+def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
+    ids = _collect_delegate_child_ids(conn, parent_ids)
+    if ids:
+        ph = ",".join("?" * len(ids))
+        conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", ids)
+        # FK safety: orphan any untagged stragglers pointing at a doomed row.
+        conn.execute(
+            f"UPDATE sessions SET parent_session_id = NULL "
+            f"WHERE parent_session_id IN ({ph})",
+            ids,
+        )
+        conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", ids)
+    return ids
+
+T = TypeVar("T")
+
+DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+
+SCHEMA_VERSION = 17
+
+# ---------------------------------------------------------------------------
+# WAL-compatibility fallback
+# ---------------------------------------------------------------------------
+# SQLite's WAL mode requires shared-memory (mmap) coordination and fcntl
+# byte-range locks that don't reliably work on network filesystems (NFS,
+# SMB/CIFS, some FUSE mounts, WSL1).  Upstream documents this explicitly:
+# https://www.sqlite.org/wal.html#sometimes_queries_return_sqlite_busy_in_wal_mode
+#
+# On those filesystems ``PRAGMA journal_mode=WAL`` raises
+# ``sqlite3.OperationalError: locking protocol`` (SQLITE_PROTOCOL).  If we
+# propagate that, every feature backed by state.db / kanban.db breaks
+# silently — /resume, /title, /history, /branch, kanban dispatcher, etc.
+#
+# Instead, fall back to ``journal_mode=DELETE`` (the pre-WAL default) which
+# works on NFS.  Concurrency drops — concurrent readers are blocked during
+# a write — but the feature works.
+_WAL_INCOMPAT_MARKERS = (
+    "locking protocol",       # SQLITE_PROTOCOL on NFS/SMB
+    "not authorized",         # Some FUSE mounts block WAL pragma outright
+)
+
+# Last SessionDB() init error, per-process.  Surfaced in /resume and
+# related slash-command error strings so users know WHY the DB is
+# unavailable instead of getting a bare "Session database not available."
+# Only SessionDB.__init__ writes to this; kanban_db.connect() failures
+# do not update it (by design — kanban failures are reported via their
+# own caller's error handling, not via /resume-style slash commands).
+_last_init_error: Optional[str] = None
+_last_init_error_lock = threading.Lock()
+
+# Paths for which we've already logged a WAL-fallback WARNING.  Without
+# this, kanban_db.connect() (called on every kanban operation — see
+# hermes_cli/kanban_db.py for ~30 call sites) would re-log the same
+# filesystem-incompat warning on every connection, filling errors.log.
+_wal_fallback_warned_paths: set[str] = set()
+_wal_fallback_warned_lock = threading.Lock()
+
+_FTS_TRIGGERS = (
+    "messages_fts_insert",
+    "messages_fts_delete",
+    "messages_fts_update",
+    "messages_fts_trigram_insert",
+    "messages_fts_trigram_delete",
+    "messages_fts_trigram_update",
+)
+
+
+def _set_last_init_error(msg: Optional[str]) -> None:
+    """Record (or clear) the most recent state.db init failure.
+
+    Thread-safe via _last_init_error_lock.  Callers pass a message to
+    record a failure or None to clear.  SessionDB.__init__ only calls
+    this to SET on failure — it deliberately does NOT clear on success,
+    because in a multi-threaded caller (e.g. gateway / web_server per-
+    request SessionDB() instantiation), a concurrent successful open
+    racing past a different thread's failure would erase the cause
+    string that thread's /resume handler is about to format.  Explicit
+    clears (e.g. test fixtures) are still supported by passing None.
+    """
+    global _last_init_error
+    with _last_init_error_lock:
+        _last_init_error = msg
+
+
+def get_last_init_error() -> Optional[str]:
+    """Return the most recent state.db init failure, if any.
+
+    Slash-command handlers (``/resume``, ``/title``, ``/history``, ``/branch``)
+    call this to surface the underlying cause in their error messages when
+    ``_session_db is None``.  Returns ``None`` if SessionDB initialized
+    successfully (or hasn't been attempted).
+    """
+    return _last_init_error
+
+
+def format_session_db_unavailable(prefix: str = "Session database not available") -> str:
+    """Format a user-facing 'session DB unavailable' message with cause.
+
+    When ``SessionDB()`` init fails, callers set ``_session_db = None`` and
+    several slash commands (/resume, /title, /history, /branch) previously
+    responded with a bare ``"Session database not available."`` — no
+    indication of WHY.  This helper includes the captured cause (typically
+    ``"locking protocol"`` from NFS/SMB) and points users at the known
+    culprit so they can fix it themselves.
+
+    Example output:
+        Session database not available: locking protocol (state.db may be
+        on NFS/SMB — see https://www.sqlite.org/wal.html).
+    """
+    cause = get_last_init_error()
+    if not cause:
+        return f"{prefix}."
+    hint = ""
+    if any(marker in cause.lower() for marker in _WAL_INCOMPAT_MARKERS):
+        hint = " (state.db may be on NFS/SMB/FUSE — see https://www.sqlite.org/wal.html)"
+    return f"{prefix}: {cause}{hint}."
+
+
+def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
+    """Read the journal mode from the SQLite DB header on disk.
+
+    Returns the mode string (e.g. ``"wal"``, ``"delete"``), or ``None``
+    if the value cannot be determined (new DB, or PRAGMA read failed).
+    """
+    try:
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    mode = row[0]
+    if isinstance(mode, bytes):  # defensive: sqlite3 occasionally returns bytes
+        try:
+            mode = mode.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    return str(mode).strip().lower() if mode is not None else None
+
+
+def apply_wal_with_fallback(
+    conn: sqlite3.Connection,
+    *,
+    db_label: str = "state.db",
+) -> str:
+    """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
+
+    Returns the journal mode actually set (``"wal"`` or ``"delete"``).
+
+    On WAL-incompatible filesystems (NFS, SMB, some FUSE), SQLite raises
+    ``OperationalError("locking protocol")`` when setting WAL.  We fall
+    back to DELETE mode — the pre-WAL default, which works on NFS — and
+    log one WARNING explaining why.
+
+    The WARNING is deduplicated per ``db_label``: repeated connections
+    to the same underlying DB (e.g. kanban_db.connect() which is called
+    on every kanban operation) log once per process, not once per call.
+    Different db_labels log independently, so state.db and kanban.db
+    each get one warning on the same NFS mount.
+
+    Shared by :class:`SessionDB` and ``hermes_cli.kanban_db.connect`` so
+    both databases get identical fallback behavior.
+
+    Never downgrades to DELETE if the on-disk DB header reports WAL — see _on_disk_journal_mode.
+    """
+    # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
+    # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
+    try:
+        current_mode = conn.execute("PRAGMA journal_mode").fetchone()
+        if current_mode and current_mode[0] == "wal":
+            return "wal"
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        return "wal"
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
+            # Unrelated OperationalError — don't silently swallow.
+            raise
+        # Don't downgrade if another process already set WAL on disk.
+        existing = _on_disk_journal_mode(conn)
+        if existing == "wal":
+            raise
+        _log_wal_fallback_once(db_label, exc)
+        conn.execute("PRAGMA journal_mode=DELETE")
+        return "delete"
+
+
+def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
+    """Log a single WARNING per (process, db_label) about WAL fallback.
+
+    Without this dedup, NFS users running kanban (which opens a fresh
+    connection on every operation — see hermes_cli/kanban_db.py) would
+    fill errors.log with hundreds of identical warnings per hour.
+    """
+    with _wal_fallback_warned_lock:
+        if db_label in _wal_fallback_warned_paths:
+            return
+        _wal_fallback_warned_paths.add(db_label)
+    logger.warning(
+        "%s: WAL journal_mode unsupported on this filesystem (%s) — "
+        "falling back to journal_mode=DELETE (slower rollback-journal "
+        "mode; reduces concurrency but works on NFS/SMB/FUSE). See "
+        "https://www.sqlite.org/wal.html for details. This warning "
+        "fires once per process per database.",
+        db_label,
+        exc,
+    )
+
+# ---------------------------------------------------------------------------
+# Malformed-schema recovery
+# ---------------------------------------------------------------------------
+# A distinct, nastier failure class than a malformed FTS *inverted index*:
+# the ``sqlite_master`` schema table itself becomes inconsistent — most
+# commonly a DUPLICATE object definition, e.g. two ``CREATE VIRTUAL TABLE
+# messages_fts`` rows.  SQLite parses the entire schema while preparing the
+# FIRST statement on a connection, so on this class *every* statement raises
+# before it runs — including ``PRAGMA journal_mode`` (which is why this trips
+# in ``apply_wal_with_fallback`` during ``SessionDB.__init__``, long before
+# ``_init_schema`` is reached) and even ``PRAGMA integrity_check`` and a plain
+# ``DROP TABLE``.  The only operations that still work are
+# ``PRAGMA writable_schema=ON`` plus direct ``sqlite_master`` surgery.
+#
+# Symptom users hit (Desktop/Dashboard show "no sessions" while 200+ JSON
+# files sit on disk):
+#   sqlite3.DatabaseError: malformed database schema (messages_fts) -
+#   table messages_fts already exists
+#
+# The canonical ``sessions`` / ``messages`` data is intact in these cases —
+# only the derived schema is broken — so recovery preserves all transcripts
+# and merely rebuilds the FTS layer.
+_MALFORMED_SCHEMA_MARKERS = (
+    "malformed database schema",
+    "database disk image is malformed",
+)
+
+# Process-global guard so auto-repair is attempted at most once per DB path
+# per process (prevents repair loops and serialises concurrent web_server /
+# gateway opens against the same malformed file).
+_repair_attempted_paths: set[str] = set()
+_repair_attempt_lock = threading.Lock()
+
+
+def is_malformed_db_error(exc: BaseException) -> bool:
+    """True if *exc* is a SQLite 'malformed schema / disk image' error.
+
+    These are the corruption classes where the schema fails to parse, so
+    targeted ``sqlite_master`` surgery (not an ordinary FTS rebuild) is the
+    only recovery path.
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
+
+
+def _claim_repair_attempt(db_path: Path) -> bool:
+    """Claim the one-shot repair attempt for *db_path* in this process.
+
+    Returns True for the first caller, False afterwards. Keeps a malformed
+    DB from triggering an unbounded repair/reopen loop and stops concurrent
+    callers from racing surgery on the same file.
+    """
+    key = str(db_path)
+    with _repair_attempt_lock:
+        if key in _repair_attempted_paths:
+            return False
+        _repair_attempted_paths.add(key)
+        return True
+
+
+def _backup_db_file(db_path: Path) -> Optional[Path]:
+    """Copy a (possibly malformed) DB file to a timestamped backup beside it.
+
+    Raw file copy on purpose: the DB won't open cleanly, so we preserve the
+    bytes exactly for forensics / manual restore. WAL and SHM sidecars are
+    copied too when present. Returns the backup path, or None on failure.
+    """
+    import datetime
+    import shutil
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
+    try:
+        shutil.copy2(db_path, backup_path)
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
+        return backup_path
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
+        return None
+
+
+def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+    """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
+
+    Runs the same first-statement (``PRAGMA journal_mode``) that trips the
+    malformed-schema parse, then ``PRAGMA integrity_check`` and a canonical
+    ``sessions`` read.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode").fetchone()
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+        if problems:
+            return "; ".join(problems[:3])
+        conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+        return None
+    except sqlite3.DatabaseError as exc:
+        return str(exc)
+    finally:
+        conn.close()
+
+
+def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+    """Repair a state.db whose ``sqlite_master`` schema is malformed.
+
+    Handles the "duplicate object definition" / malformed-schema class where
+    even ``PRAGMA`` statements fail. Tries least-destructive recovery first
+    and escalates:
+
+      1. **De-duplicate** ``sqlite_master`` (keep the lowest rowid per
+         ``type``/``name``). Fixes the canonical "table X already exists"
+         case and PRESERVES the existing FTS index intact.
+      2. **Drop the FTS schema** (every ``messages_fts*`` object) + ``VACUUM``.
+         The next ``SessionDB()`` open rebuilds the FTS indexes from the
+         canonical ``messages`` table.
+
+    Canonical ``sessions`` / ``messages`` rows are never modified. A
+    timestamped raw backup is taken first unless ``backup=False``.
+
+    Returns a report dict: ``{repaired: bool, strategy: str|None,
+    backup_path: str|None, error: str|None}``.
+    """
+    report: Dict[str, Any] = {
+        "repaired": False,
+        "strategy": None,
+        "backup_path": None,
+        "error": None,
+    }
+
+    db_path = Path(db_path)
+    if not db_path.exists():
+        report["error"] = f"{db_path} does not exist"
+        return report
+
+    if backup:
+        bpath = _backup_db_file(db_path)
+        report["backup_path"] = str(bpath) if bpath else None
+
+    # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.execute("PRAGMA writable_schema=ON")
+            dupes = conn.execute(
+                "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep "
+                "FROM sqlite_master GROUP BY type, name HAVING c > 1"
+            ).fetchall()
+            for type_, name, _count, keep in dupes:
+                conn.execute(
+                    "DELETE FROM sqlite_master "
+                    "WHERE type IS ? AND name IS ? AND rowid <> ?",
+                    (type_, name, keep),
+                )
+            conn.execute("PRAGMA writable_schema=OFF")
+            conn.commit()
+        finally:
+            conn.close()
+        if _db_opens_cleanly(db_path) is None:
+            report["repaired"] = True
+            report["strategy"] = "dedup_schema"
+            logger.warning(
+                "state.db schema repaired by de-duplicating sqlite_master "
+                "(FTS index preserved): %s", db_path
+            )
+            return report
+    except sqlite3.DatabaseError as exc:
+        logger.warning("state.db dedup repair pass failed: %s", exc)
+
+    # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
+    try:
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
+            conn.execute("PRAGMA writable_schema=OFF")
+            conn.commit()
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+        reason = _db_opens_cleanly(db_path)
+        if reason is None:
+            report["repaired"] = True
+            report["strategy"] = "drop_fts_rebuild"
+            logger.warning(
+                "state.db schema repaired by dropping FTS schema; indexes "
+                "will rebuild from messages on next open: %s", db_path
+            )
+            return report
+        report["error"] = reason
+    except sqlite3.DatabaseError as exc:
+        report["error"] = str(exc)
+
+    if not report["repaired"]:
+        logger.error(
+            "state.db schema repair could not recover %s automatically "
+            "(backup: %s); manual restore from backup may be required.",
+            db_path, report["backup_path"],
+        )
+    return report
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    user_id TEXT,
+    model TEXT,
+    model_config TEXT,
+    system_prompt TEXT,
+    parent_session_id TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    end_reason TEXT,
+    message_count INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    billing_provider TEXT,
+    billing_base_url TEXT,
+    billing_mode TEXT,
+    estimated_cost_usd REAL,
+    actual_cost_usd REAL,
+    cost_status TEXT,
+    cost_source TEXT,
+    pricing_version TEXT,
+    title TEXT,
+    api_call_count INTEGER DEFAULT 0,
+    handoff_state TEXT,
+    handoff_platform TEXT,
+    handoff_error TEXT,
+    rewind_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    migrated_to_state_db INTEGER NOT NULL DEFAULT 0,
+    resume_pending INTEGER NOT NULL DEFAULT 0,
+    resume_reason TEXT,
+    last_resume_marked_at REAL,
+    suspended INTEGER NOT NULL DEFAULT 0,
+    lineage_version INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    role TEXT NOT NULL,
+    content TEXT,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    tool_name TEXT,
+    timestamp REAL NOT NULL,
+    token_count INTEGER,
+    finish_reason TEXT,
+    reasoning TEXT,
+    reasoning_content TEXT,
+    reasoning_details TEXT,
+    codex_reasoning_items TEXT,
+    codex_message_items TEXT,
+    platform_message_id TEXT,
+    observed INTEGER DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS state_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS compression_locks (
+    session_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'INTERACTIVE',
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    heartbeat_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_compression_locks_mode ON compression_locks(mode);
+
+-- RT01-B/C: New columns on sessions table (auto-reconciled)
+-- These are declared here so _reconcile_columns adds them on existing DBs.
+-- migrated_to_state_db: 1 after gateway session index import
+-- resume_pending: set by restart watchdog, cleared after successful turn
+-- resume_reason: why resume_pending was set (e.g. "restart_timeout")
+-- last_resume_marked_at: unix timestamp of last resume_pending marking
+-- suspended: hard reset signal from /stop or stuck-loop escalation
+-- NOTE: Column additions are in SCHEMA_SQL so _reconcile_columns picks them up.
+
+-- RT01-B: Gateway session index
+CREATE TABLE IF NOT EXISTS gateway_session_index (
+    session_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    platform TEXT,
+    chat_type TEXT DEFAULT 'dm',
+    display_name TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+-- RT01-C: Session recovery log
+CREATE TABLE IF NOT EXISTS session_recovery_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key TEXT NOT NULL,
+    session_id TEXT,
+    event_type TEXT NOT NULL,
+    reason TEXT,
+    timestamp REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_log_session_key
+    ON session_recovery_log(session_key, timestamp DESC);
+
+-- RT01-B/C: Migration state machine
+CREATE TABLE IF NOT EXISTS migration_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+-- RT-02 Compression Reliability schema
+CREATE TABLE IF NOT EXISTS compression_lineage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    child_session_id TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    tokens_before INTEGER NOT NULL,
+    tokens_after INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    rollback_token TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(child_session_id),
+    FOREIGN KEY (child_session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_compression_lineage_parent
+    ON compression_lineage(parent_session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS compression_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    rollback_token TEXT NOT NULL UNIQUE,
+    consumed INTEGER NOT NULL DEFAULT 0,
+    consumed_at REAL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_compression_checkpoints_session
+    ON compression_checkpoints(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_compression_checkpoints_token
+    ON compression_checkpoints(rollback_token);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_session
+    ON idempotency_keys(session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS session_mutation (
+    session_id TEXT PRIMARY KEY,
+    in_progress INTEGER NOT NULL DEFAULT 0,
+    holder TEXT,
+    acquired_at REAL,
+    expires_at REAL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_mutation_expires
+    ON session_mutation(expires_at);
+
+CREATE TABLE IF NOT EXISTS session_archive (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    messages_json TEXT NOT NULL,
+    archived_at REAL NOT NULL,
+    archive_reason TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_archive_session
+    ON session_archive(session_id, archived_at DESC);
+
+CREATE TABLE IF NOT EXISTS migration_anomalies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phase TEXT NOT NULL,
+    session_id TEXT,
+    description TEXT NOT NULL,
+    context_json TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_migration_anomalies_phase
+    ON migration_anomalies(phase, created_at DESC);
+
+-- Durable, file-grounded execution ledger. Records which files the agent has
+-- already modified in a task so the fact survives context compression (which
+-- rotates session_id and drops completed TodoStore items). Re-injected IN FULL
+-- post-compression so the agent never recreates / re-edits work it already
+-- finished. No FK to sessions(id): carry_forward_execution_ledger() re-keys
+-- rows to the post-compression successor id before that session row exists, and
+-- a cascade-delete must never silently drop an in-flight task's ledger.
+CREATE TABLE IF NOT EXISTS execution_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    action TEXT NOT NULL,
+    summary TEXT,
+    edit_count INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(session_id, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_ledger_session
+    ON execution_ledger(session_id, updated_at DESC);
+
+-- Verification ledger — the second half of the execution_ledger's stated
+-- problem ("re-editing a file it already fixed OR skipping verification it
+-- already ran"). Records the verification/build commands the agent ran so the
+-- fact survives compression. Re-injected with a re-run reminder and a STALE
+-- marker (a check is stale once a file is modified after it ran), so a
+-- pre-compression PASS never licenses skipping re-verification. Same FK-less /
+-- carry-forward / prune contract as execution_ledger.
+CREATE TABLE IF NOT EXISTS verification_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    command TEXT NOT NULL,
+    exit_code INTEGER,
+    passed INTEGER,
+    output_snippet TEXT,
+    run_count INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(session_id, command)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_ledger_session
+    ON verification_ledger(session_id, updated_at DESC);
+"""
+
+# Indexes that reference columns added in later schema versions must be
+# created AFTER _reconcile_columns() has had a chance to ADD them on
+# existing databases. SCHEMA_SQL above is run by sqlite executescript
+# which would otherwise fail on legacy DBs ("no such column: active").
+DEFERRED_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_messages_session_active
+    ON messages(session_id, active, timestamp);
+"""
+
+FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (
+        new.id,
+        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM messages_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
+    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts(rowid, content) VALUES (
+        new.id,
+        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+    );
+END;
+"""
+
+# Trigram FTS5 table for CJK substring search.  The default unicode61
+# tokenizer splits CJK characters into individual tokens, breaking phrase
+# matching.  The trigram tokenizer creates overlapping 3-byte sequences so
+# substring queries work natively for any script (CJK, Thai, etc.).
+FTS_TRIGRAM_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
+    content,
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+        new.id,
+        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
+    DELETE FROM messages_fts_trigram WHERE rowid = old.id;
+    INSERT INTO messages_fts_trigram(rowid, content) VALUES (
+        new.id,
+        COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+    );
+END;
+"""
+
+
+# Regression-test coverage classification (for the HERMES_REGRESSION_GATE).
+_SOURCE_CODE_EXTS = (
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".rb", ".java", ".kt",
+    ".php", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".swift", ".scala", ".m", ".mm",
+)
+
+
+def _is_test_path(path: str) -> bool:
+    """True if a path looks like a test/spec file or lives under a test dir."""
+    p = path.replace("\\", "/").lower()
+    base = p.rsplit("/", 1)[-1]
+    if base.startswith("test_") or base == "conftest.py":
+        return True
+    if any(seg in p for seg in ("/tests/", "/test/", "/spec/", "/__tests__/")):
+        return True
+    stem = base.rsplit(".", 1)[0]
+    return stem.endswith("_test") or stem.endswith("_spec") or ".test." in base or ".spec." in base
+
+
+def _is_source_code(path: str) -> bool:
+    """True if a path is a non-test source-code file (a change that warrants a test)."""
+    return path.lower().endswith(_SOURCE_CODE_EXTS) and not _is_test_path(path)
+
+
+class SessionDB:
+    """
+    SQLite-backed session storage with FTS5 search.
+
+    Thread-safe for the common gateway pattern (multiple reader threads,
+    single writer via WAL mode). Each method opens its own cursor.
+    """
+
+    # ── Write-contention tuning ──
+    # With multiple hermes processes (gateway + CLI sessions + worktree agents)
+    # all sharing one state.db, WAL write-lock contention causes visible TUI
+    # freezes.  SQLite's built-in busy handler uses a deterministic sleep
+    # schedule that causes convoy effects under high concurrency.
+    #
+    # Instead, we keep the SQLite timeout short (1s) and handle retries at the
+    # application level with random jitter, which naturally staggers competing
+    # writers and avoids the convoy.
+    _WRITE_MAX_RETRIES = 15
+    _WRITE_RETRY_MIN_S = 0.020   # 20ms
+    _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    # Attempt a PASSIVE WAL checkpoint every N successful writes.
+    _CHECKPOINT_EVERY_N_WRITES = 50
+
+    def __init__(self, db_path: Path = None, read_only: bool = False):
+        self.db_path = db_path or DEFAULT_DB_PATH
+        self.read_only = read_only
+
+        self._lock = threading.Lock()
+        self._write_count = 0
+        self._fts_enabled = False
+        self._fts_unavailable_warned = False
+        self._conn = None
+
+        # RT-01 Phase 1: backup, integrity, safe-mode subsystems
+        self._backup_mgr = StateDBBackupManager(self.db_path)
+        self.safe_mode = SafeModeState()
+        self._integrity_ok = True
+        self._last_init_error: Optional[str] = None
+
+        try:
+            if read_only:
+                # Read-only attach for cross-profile aggregation: SELECT-only,
+                # so we skip schema init entirely (no DDL, no FTS probe, no
+                # column reconcile). Crucially this takes NO write lock, so
+                # polling another profile's live DB on every sidebar refresh
+                # never contends with that profile's running backend. The DB
+                # must already exist + be initialised (callers guard on
+                # db_path.exists()); a SELECT against an empty file raises and
+                # the caller degrades per-profile.
+                self._conn = sqlite3.connect(
+                    f"file:{self.db_path}?mode=ro",
+                    uri=True,
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+                self._conn.row_factory = sqlite3.Row
+                return
+
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            def _connect_and_init():
+                self._conn = sqlite3.connect(
+                    str(self.db_path),
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+                self._conn.row_factory = sqlite3.Row
+                apply_wal_with_fallback(self._conn, db_label="state.db")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._init_schema()
+                # RT-01 Phase 1: run L1/L2/L3 integrity validation after init.
+                self._run_startup_integrity()
+                # RT-01 Phase 1: daily snapshot only once per day.
+                self._backup_mgr.create_daily_snapshot()
+
+            try:
+                _connect_and_init()
+            except sqlite3.DatabaseError as exc:
+                # RT-01 Phase 1: no longer auto-repair with writable_schema=ON.
+                # Back up the DB, activate safe mode, and re-raise so callers
+                # can surface the issue. Operator must run /repair-state-db.
+                logger.error(
+                    "state.db schema is malformed or corrupt (%s) — activating "
+                    "safe mode; run 'hermes repair-state-db' to diagnose.", exc,
+                )
+                try:
+                    if self._conn is not None:
+                        self._conn.close()
+                        self._conn = None
+                except Exception:
+                    pass
+                snapshot = self._backup_mgr.create_repair_snapshot()
+                self.safe_mode.activate(
+                    f"database open/integrity failure ({type(exc).__name__}: {exc}); "
+                    f"repair snapshot at {snapshot.get('path', 'unknown')}"
+                )
+                self._integrity_ok = False
+                _set_last_init_error(f"{type(exc).__name__}: {exc}")
+                raise
+
+            # RT-01 Phase 2: run migration engine M0-M3 for B/C.
+            self._migration_engine = RT01MigrationEngine(
+                self.db_path,
+                self.db_path.parent / "sessions.json",
+                self._conn,
+                self._backup_mgr,
+            )
+            migration_report = self._migration_engine.run_migration()
+            if migration_report.get("status") != "complete":
+                # Migration failure is not fatal at startup; safe mode prevents
+                # writes and operator can diagnose.  However we still log and
+                # mark integrity not OK so health checks surface it.
+                logger.error("RT01 migration did not complete: %s", migration_report)
+                self._integrity_ok = False
+                # Do NOT activate safe mode for incomplete migration at startup
+                # because gateway may need to read legacy sessions.json.  Writes
+                # to state.db would still be blocked if safe mode were active.
+
+        except Exception as exc:
+            # Capture the cause so /resume and friends can surface WHY the
+            # session DB is unavailable instead of a bare "Session database
+            # not available."  Callers that catch this exception keep their
+            # existing ``self._session_db = None`` degradation path.
+            _set_last_init_error(f"{type(exc).__name__}: {exc}")
+            raise
+
+    def _run_startup_integrity(self) -> None:
+        """RT-01 Phase 1: run L1/L2/L3 integrity validation and safe-mode on failure."""
+        try:
+            validator = StartupIntegrityValidator(self._conn)
+            result = validator.run_all()
+        except Exception as exc:
+            logger.error("state.db startup integrity validation raised: %s", exc)
+            self.safe_mode.activate(f"integrity validation raised: {exc}")
+            self._integrity_ok = False
+            return
+
+        if not result.get("passed"):
+            details = result.get("levels", {})
+            reason = "startup integrity validation failed"
+            for level, level_result in details.items():
+                if not level_result.get("passed"):
+                    err = level_result.get("details", {}).get("error")
+                    if err:
+                        reason = f"{level} validation failed: {err}"
+                        break
+            snapshot = self._backup_mgr.create_repair_snapshot()
+            self.safe_mode.activate(f"{reason}; repair snapshot at {snapshot.get('path', 'unknown')}")
+            self._integrity_ok = False
+            logger.error("state.db %s", reason)
+        else:
+            self._integrity_ok = True
+
+    def _maybe_trigger_hot_backup(self) -> None:
+        """RT-01 Phase 1: periodically trigger a hot backup after writes."""
+        if self.read_only:
+            return
+        if self._backup_mgr.should_create_hot_backup():
+            self._backup_mgr.create_hot_backup()
+            self._backup_mgr.cleanup_old_backups()
+
+    # ── Core write helper ──
+
+    @staticmethod
+    def _is_fts5_unavailable_error(exc: sqlite3.OperationalError) -> bool:
+        err = str(exc).lower()
+        return "no such module" in err and "fts5" in err
+
+    def _warn_fts5_unavailable(self, exc: sqlite3.OperationalError) -> None:
+        self._fts_enabled = False
+        if self._fts_unavailable_warned:
+            return
+        self._fts_unavailable_warned = True
+        logger.warning(
+            "SQLite FTS5 unavailable for %s; full-text session search "
+            "disabled. Run `hermes update` to rebuild the venv with a "
+            "current Python (managed uv guarantees FTS5). "
+            "(underlying error: %s)",
+            self.db_path,
+            exc,
+        )
+
+    def _sqlite_supports_fts5(self, cursor: sqlite3.Cursor) -> bool:
+        try:
+            cursor.execute("CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)")
+            cursor.execute("DROP TABLE temp._hermes_fts5_probe")
+            return True
+        except sqlite3.OperationalError as exc:
+            if not self._is_fts5_unavailable_error(exc):
+                raise
+            self._warn_fts5_unavailable(exc)
+            return False
+
+    @staticmethod
+    def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
+        for trigger in _FTS_TRIGGERS:
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+
+    @staticmethod
+    def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
+        placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
+        row = cursor.execute(
+            f"SELECT COUNT(*) FROM sqlite_master "
+            f"WHERE type = 'trigger' AND name IN ({placeholders})",
+            _FTS_TRIGGERS,
+        ).fetchone()
+        return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
+
+    @staticmethod
+    def _rebuild_fts_indexes(cursor: sqlite3.Cursor) -> None:
+        for table_name in ("messages_fts", "messages_fts_trigram"):
+            cursor.execute(f"DELETE FROM {table_name}")
+        cursor.execute(
+            "INSERT INTO messages_fts(rowid, content) "
+            "SELECT id, "
+            "COALESCE(content, '') || ' ' || "
+            "COALESCE(tool_name, '') || ' ' || "
+            "COALESCE(tool_calls, '') "
+            "FROM messages"
+        )
+        cursor.execute(
+            "INSERT INTO messages_fts_trigram(rowid, content) "
+            "SELECT id, "
+            "COALESCE(content, '') || ' ' || "
+            "COALESCE(tool_name, '') || ' ' || "
+            "COALESCE(tool_calls, '') "
+            "FROM messages"
+        )
+
+    def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
+        try:
+            cursor.execute(f"SELECT * FROM {table_name} LIMIT 0")
+            return True
+        except sqlite3.OperationalError as exc:
+            if self._is_fts5_unavailable_error(exc):
+                self._warn_fts5_unavailable(exc)
+                return None
+            if "no such table" in str(exc).lower():
+                return False
+            raise
+
+    def _ensure_fts_schema(
+        self,
+        cursor: sqlite3.Cursor,
+        table_name: str,
+        ddl: str,
+    ) -> bool:
+        status = self._fts_table_probe(cursor, table_name)
+        if status is None:
+            return False
+        try:
+            # Run even when the virtual table exists so any dropped or missing
+            # triggers are recreated after a previous no-FTS5 runtime disabled
+            # them to keep message writes working.
+            cursor.executescript(ddl)
+            return True
+        except sqlite3.OperationalError as exc:
+            if not self._is_fts5_unavailable_error(exc):
+                raise
+            self._warn_fts5_unavailable(exc)
+            return False
+
+    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
+
+        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
+        statements.  The caller must NOT call ``commit()`` — that's handled
+        here after *fn* returns.
+
+        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
+        (not at commit time), so lock contention surfaces immediately.
+        On ``database is locked``, we release the Python lock, sleep a
+        random 20-150ms, and retry — breaking the convoy pattern that
+        SQLite's built-in deterministic backoff creates.
+
+        Returns whatever *fn* returns.
+        """
+        last_err: Optional[Exception] = None
+        # RT-01 Phase 1: refuse writes in safe mode
+        self.safe_mode.check_write_allowed()
+        for attempt in range(self._WRITE_MAX_RETRIES):
+            try:
+                with self._lock:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        result = fn(self._conn)
+                        self._conn.commit()
+                    except BaseException:
+                        try:
+                            self._conn.rollback()
+                        except Exception:
+                            pass
+                        raise
+                # Success — periodic best-effort checkpoint + hot backup trigger.
+                self._write_count += 1
+                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                    self._try_wal_checkpoint()
+                # RT-01 Phase 1: periodic hot backup
+                self._maybe_trigger_hot_backup()
+                return result
+            except sqlite3.OperationalError as exc:
+                err_msg = str(exc).lower()
+                if "locked" in err_msg or "busy" in err_msg:
+                    last_err = exc
+                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                        jitter = random.uniform(
+                            self._WRITE_RETRY_MIN_S,
+                            self._WRITE_RETRY_MAX_S,
+                        )
+                        time.sleep(jitter)
+                        continue
+                # Non-lock error or retries exhausted — propagate.
+                raise
+        # Retries exhausted (shouldn't normally reach here).
+        raise last_err or sqlite3.OperationalError(
+            "database is locked after max retries"
+        )
+
+    def _try_wal_checkpoint(self) -> None:
+        """Best-effort TRUNCATE WAL checkpoint.  Never raises.
+
+        Flushes committed WAL frames back into the main DB file and
+        truncates the WAL file to zero bytes.  Keeps the WAL from
+        growing unbounded when many processes hold persistent
+        connections.
+
+        PASSIVE checkpoint was previously used here, but it never
+        truncates the WAL file — the file stays at its high-water
+        mark until an explicit TRUNCATE is called (which only
+        happened inside the infrequent vacuum()).
+
+        TRUNCATE may block writers briefly while checkpointing, but
+        _try_wal_checkpoint is called off the hot path (every 50
+        writes) and already runs under ``self._lock``, so the
+        additional hold time is negligible.
+        """
+        try:
+            with self._lock:
+                result = self._conn.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if result and result[1] > 0:
+                    logger.debug(
+                        "WAL checkpoint: %d/%d pages checkpointed",
+                        result[2], result[1],
+                    )
+        except Exception:
+            pass  # Best effort — never fatal.
+
+    def close(self):
+        """Close the database connection.
+
+        Attempts a TRUNCATE WAL checkpoint first so that exiting processes
+        help shrink the WAL file.
+        """
+        with self._lock:
+            if self._conn:
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
+                self._conn.close()
+                self._conn = None
+
+    @staticmethod
+    def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
+        """Extract expected columns per table from SCHEMA_SQL.
+
+        Uses an in-memory SQLite database to parse the SQL — SQLite itself
+        handles all syntax (DEFAULT expressions with commas, inline
+        REFERENCES, CHECK constraints, etc.) so there are zero regex
+        edge cases.  The in-memory DB is opened, the schema DDL is
+        executed, and PRAGMA table_info extracts the column metadata.
+
+        Adding a column to SCHEMA_SQL is all that's needed; the
+        reconciliation loop picks it up automatically.
+        """
+        ref = sqlite3.connect(":memory:")
+        try:
+            ref.executescript(schema_sql)
+            table_columns: Dict[str, Dict[str, str]] = {}
+            for (tbl,) in ref.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall():
+                cols: Dict[str, str] = {}
+                for row in ref.execute(
+                    f'PRAGMA table_info("{tbl}")'
+                ).fetchall():
+                    # row: (cid, name, type, notnull, dflt_value, pk)
+                    col_name = row[1]
+                    col_type = row[2] or ""
+                    notnull = row[3]
+                    default = row[4]
+                    pk = row[5]
+                    # Reconstruct the type expression for ALTER TABLE ADD COLUMN
+                    parts = [col_type] if col_type else []
+                    if notnull and not pk:
+                        parts.append("NOT NULL")
+                    if default is not None:
+                        parts.append(f"DEFAULT {default}")
+                    cols[col_name] = " ".join(parts)
+                table_columns[tbl] = cols
+            return table_columns
+        finally:
+            ref.close()
+
+    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
+        """Ensure live tables have every column declared in SCHEMA_SQL.
+
+        Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
+        in SCHEMA_SQL is the single source of truth for the desired schema.
+        On every startup this method diffs the live columns (via PRAGMA
+        table_info) against the declared columns, and ADDs any that are
+        missing.
+
+        This makes column additions a declarative operation — just add
+        the column to SCHEMA_SQL and it appears on the next startup.
+        Version-gated migration blocks are no longer needed for ADD COLUMN.
+        """
+        expected = self._parse_schema_columns(SCHEMA_SQL)
+        for table_name, declared_cols in expected.items():
+            # Get current columns from the live table
+            try:
+                rows = cursor.execute(
+                    f'PRAGMA table_info("{table_name}")'
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue  # Table doesn't exist yet (shouldn't happen after executescript)
+            live_cols = set()
+            for row in rows:
+                # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
+                name = row[1] if isinstance(row, (tuple, list)) else row["name"]
+                live_cols.add(name)
+
+            for col_name, col_type in declared_cols.items():
+                if col_name not in live_cols:
+                    safe_name = col_name.replace('"', '""')
+                    try:
+                        cursor.execute(
+                            f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
+                        )
+                    except sqlite3.OperationalError as exc:
+                        # Expected: "duplicate column name" from a race or
+                        # re-run.  Unexpected: "Cannot add a NOT NULL column
+                        # with default value NULL" from a schema mistake.
+                        # Log at DEBUG so it's visible in agent.log.
+                        logger.debug(
+                            "reconcile %s.%s: %s", table_name, col_name, exc,
+                        )
+
+    def _init_schema(self):
+        """Create tables and FTS if they don't exist, reconcile columns.
+
+        Schema management follows the declarative reconciliation pattern
+        (Beets, sqlite-utils): SCHEMA_SQL is the single source of truth.
+        On existing databases, _reconcile_columns() diffs live columns
+        against SCHEMA_SQL and ADDs any missing ones.  This eliminates
+        the version-gated migration chain for column additions, making
+        it impossible for reordered or inserted migrations to skip columns.
+
+        The schema_version table is retained for future data migrations
+        (transforming existing rows) which cannot be handled declaratively.
+        """
+        cursor = self._conn.cursor()
+
+        cursor.executescript(SCHEMA_SQL)
+
+        # ── Declarative column reconciliation ──────────────────────────
+        # Diff live tables against SCHEMA_SQL and ADD any missing columns.
+        # This is idempotent and self-healing: even if a version-gated
+        # migration was skipped (e.g. due to version renumbering), the
+        # column gets created here.
+        self._reconcile_columns(cursor)
+
+        # Indexes that reference reconciler-added columns must be created
+        # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
+        # makes the initial executescript fail on legacy DBs (the index's
+        # WHERE clause references a column that doesn't exist yet).
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
+                "ON messages(session_id, platform_message_id) "
+                "WHERE platform_message_id IS NOT NULL"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
+
+        # Deferred indexes that reference the reconciler-added ``active``
+        # column (idx_messages_session_active) — same ordering constraint.
+        cursor.executescript(DEFERRED_INDEX_SQL)
+
+        fts5_available = self._sqlite_supports_fts5(cursor)
+        fts_migrations_complete = True
+        if not fts5_available:
+            # Existing FTS triggers can still fire on messages INSERT/UPDATE
+            # even though the current sqlite runtime cannot read the virtual
+            # tables they target. Drop only the triggers so core persistence
+            # continues; if a future runtime has FTS5, _ensure_fts_schema()
+            # recreates them.
+            self._drop_fts_triggers(cursor)
+
+        # ── Schema version bookkeeping ─────────────────────────────────
+        # Bump to current so future data migrations (if any) can gate on
+        # version.  No version-gated column additions remain.
+        cursor.execute("SELECT version FROM schema_version LIMIT 1")
+        row = cursor.fetchone()
+        if row is None:
+            cursor.execute(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                (SCHEMA_VERSION,),
+            )
+        else:
+            current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
+            # Data migrations that can't be expressed declaratively (row
+            # backfills, index changes tied to a specific version step) stay
+            # in a version-gated chain. Column additions are handled by
+            # _reconcile_columns() above and no longer need entries here.
+            if current_version < 10 and SCHEMA_VERSION == 10:
+                # v10: trigram FTS5 table for CJK/substring search. The
+                # virtual table + triggers are created unconditionally via
+                # FTS_TRIGRAM_SQL below, but existing rows need a one-time
+                # backfill into the FTS index.
+                #
+                # Only run this when v10 itself is the target schema. Current
+                # v11+ code drops and rebuilds both FTS tables below, so doing
+                # the v10-only trigram backfill first only burns startup time
+                # and WAL space before v11 throws the work away.
+                if fts5_available:
+                    _fts_trigram_exists = self._fts_table_probe(
+                        cursor, "messages_fts_trigram"
+                    )
+                    if _fts_trigram_exists is False:
+                        if self._ensure_fts_schema(
+                            cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                        ):
+                            cursor.execute(
+                                "INSERT INTO messages_fts_trigram(rowid, content) "
+                                "SELECT id, content FROM messages WHERE content IS NOT NULL"
+                            )
+                        else:
+                            fts_migrations_complete = False
+                    elif _fts_trigram_exists is None:
+                        fts_migrations_complete = False
+                else:
+                    fts_migrations_complete = False
+            if current_version < 11:
+                # v11: re-index FTS5 tables to cover tool_name + tool_calls and
+                # switch from external-content to inline mode. Existing DBs have
+                # old-schema FTS tables and triggers that IF NOT EXISTS won't
+                # overwrite, so we drop them explicitly and let the post-migration
+                # existence checks (below) recreate them from FTS_SQL /
+                # FTS_TRIGRAM_SQL, then backfill every message row. Fixes #16751.
+                if fts5_available:
+                    self._drop_fts_triggers(cursor)
+                    for _tbl in ("messages_fts", "messages_fts_trigram"):
+                        try:
+                            cursor.execute(f"DROP TABLE IF EXISTS {_tbl}")
+                        except sqlite3.OperationalError as exc:
+                            if not self._is_fts5_unavailable_error(exc):
+                                raise
+                            self._warn_fts5_unavailable(exc)
+                            fts5_available = False
+                            fts_migrations_complete = False
+                            break
+
+                    if fts5_available:
+                        # Recreate virtual tables + triggers with the new inline-mode
+                        # schema that indexes content || tool_name || tool_calls.
+                        if (
+                            self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
+                            and self._ensure_fts_schema(
+                                cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                            )
+                        ):
+                            # Backfill both indexes from every existing messages row.
+                            cursor.execute(
+                                "INSERT INTO messages_fts(rowid, content) "
+                                "SELECT id, "
+                                "COALESCE(content, '') || ' ' || "
+                                "COALESCE(tool_name, '') || ' ' || "
+                                "COALESCE(tool_calls, '') "
+                                "FROM messages"
+                            )
+                            cursor.execute(
+                                "INSERT INTO messages_fts_trigram(rowid, content) "
+                                "SELECT id, "
+                                "COALESCE(content, '') || ' ' || "
+                                "COALESCE(tool_name, '') || ' ' || "
+                                "COALESCE(tool_calls, '') "
+                                "FROM messages"
+                            )
+                        else:
+                            fts_migrations_complete = False
+                else:
+                    fts_migrations_complete = False
+            if current_version < 12:
+                # v12: messages.active flag for rewind/undo soft-deletion.
+                # The declarative reconcile_columns() above adds the
+                # column itself; this UPDATE is belt-and-suspenders to
+                # ensure any rows that pre-existed the ADD COLUMN have
+                # active=1 rather than NULL.
+                try:
+                    cursor.execute(
+                        "UPDATE messages SET active = 1 WHERE active IS NULL"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            if current_version < 16:
+                # v16: tag delegate subagent rows so pickers stay clean after
+                # parent deletes that used to orphan them (parent_session_id → NULL).
+                try:
+                    cursor.execute(
+                        "UPDATE sessions SET model_config = json_set("
+                        "COALESCE(model_config, '{}'), '$._delegate_from', parent_session_id) "
+                        f"WHERE parent_session_id IS NOT NULL "
+                        "AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
+                        f"AND {_ephemeral_child_sql('sessions')}"
+                    )
+                    cursor.execute(
+                        "UPDATE sessions SET model_config = json_set("
+                        "COALESCE(model_config, '{}'), '$._delegate_from', '__orphaned__') "
+                        "WHERE parent_session_id IS NULL "
+                        "AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
+                        "AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL "
+                        "AND title IS NULL "
+                        "AND message_count <= 25 "
+                        "AND EXISTS (SELECT 1 FROM messages m "
+                        "            WHERE m.session_id = sessions.id AND m.role = 'tool') "
+                        "AND NOT EXISTS (SELECT 1 FROM sessions ch "
+                        "                WHERE ch.parent_session_id = sessions.id)"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            if current_version < 17:
+                # v17: RT-02 Compression Reliability.
+                # New tables are created by SCHEMA_SQL IF NOT EXISTS above.
+                # Data migration: populate compression_lineage from existing
+                # sessions that have a parent_session_id and look like a
+                # compression child (title contains 'compressed' or messages
+                # were cut). This is best-effort; missing lineage entries are
+                # handled defensively by the coordinator.
+                try:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO compression_lineage "
+                        "(child_session_id, parent_session_id, strategy, trigger, "
+                        "tokens_before, tokens_after, content_hash, rollback_token, created_at) "
+                        "SELECT s.id, s.parent_session_id, 'UNKNOWN', 'LEGACY_MIGRATION', "
+                        "COALESCE(p.input_tokens + p.output_tokens, 0), "
+                        "COALESCE(s.input_tokens + s.output_tokens, 0), "
+                        "'legacy:' || s.id, "
+                        "'legacy-rollback-' || s.id, "
+                        "COALESCE(s.started_at, ?) "
+                        "FROM sessions s JOIN sessions p ON p.id = s.parent_session_id "
+                        "WHERE s.parent_session_id IS NOT NULL "
+                        "AND s.title LIKE '%compressed%'",
+                        (time.time(),),
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                # Also backfill lineage for ALL parent-child relationships
+                # (not just 'compressed' titles) and initialize lineage_version
+                try:
+                    from hermes_state_migration import CompressionLineageMigration
+                    CompressionLineageMigration.run(cursor)
+                    CompressionLineageMigration.rebuild_lineage_versions(cursor)
+                except (sqlite3.OperationalError, ImportError):
+                    pass
+            if current_version < SCHEMA_VERSION and fts_migrations_complete:
+                cursor.execute(
+                    "UPDATE schema_version SET version = ?",
+                    (SCHEMA_VERSION,),
+                )
+
+        # Unique title index — always ensure it exists
+        try:
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
+                "ON sessions(title) WHERE title IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+
+        if fts5_available:
+            # FTS5 setup. Run the DDL even when the virtual table exists so
+            # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
+            # an earlier no-FTS5 runtime.
+            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
+
+            # Trigram FTS5 for CJK/substring search. This is optional relative
+            # to the main FTS table; if it cannot be created, CJK search falls
+            # back to LIKE.
+            if self._fts_enabled:
+                trigram_enabled = self._ensure_fts_schema(
+                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                )
+                if trigram_enabled and triggers_need_repair:
+                    self._rebuild_fts_indexes(cursor)
+
+        self._conn.commit()
+
+    # =========================================================================
+    # Session lifecycle
+    # =========================================================================
+
+    def _insert_session_row(
+        self,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+    ) -> None:
+        """Shared INSERT OR IGNORE for session rows."""
+        def _do(conn):
+            conn.execute(
+                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
+                   system_prompt, parent_session_id, cwd, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    source,
+                    user_id,
+                    model,
+                    json.dumps(model_config) if model_config else None,
+                    system_prompt,
+                    parent_session_id,
+                    cwd,
+                    time.time(),
+                ),
+            )
+        self._execute_write(_do)
+
+    def create_session(self, session_id: str, source: str, **kwargs) -> str:
+        """Create a new session record. Returns the session_id."""
+        self._insert_session_row(session_id, source, **kwargs)
+        return session_id
+    def end_session(self, session_id: str, end_reason: str) -> None:
+        """Mark a session as ended.
+
+        No-ops when the session is already ended. The first end_reason wins:
+        compression-split sessions must keep their ``end_reason = 'compression'``
+        record even if a later stale ``end_session()`` call (e.g. from a
+        desynced CLI session_id after ``/resume`` or ``/branch``) targets them
+        with a different reason. Use ``reopen_session()`` first if you
+        intentionally need to re-end a closed session with a new reason.
+        """
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                "WHERE id = ? AND ended_at IS NULL",
+                (time.time(), end_reason, session_id),
+            )
+        self._execute_write(_do)
+
+        # Opportunistic janitor for the FK-less execution ledger. Age-based, so it
+        # never touches the fresh rows of a session currently rotating under
+        # end_reason='compression' — only long-dead tasks' rows are pruned.
+        try:
+            self.prune_execution_ledger()
+        except Exception:
+            pass
+
+    def reopen_session(self, session_id: str) -> None:
+        """Clear ended_at/end_reason so a session can be resumed."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                (session_id,),
+            )
+        self._execute_write(_do)
+
+    def update_session_cwd(self, session_id: str, cwd: str) -> None:
+        """Persist the session working directory when a frontend knows it."""
+        if not session_id or not cwd:
+            return
+
+        def _do(conn):
+            conn.execute("UPDATE sessions SET cwd = ? WHERE id = ?", (cwd, session_id))
+
+        self._execute_write(_do)
+    # ──────────────────────────────────────────────────────────────────────
+    # Compression locks
+    # ──────────────────────────────────────────────────────────────────────
+    # Atomic per-session locks that prevent two compression paths from
+    # racing on the same session_id and producing orphan child sessions.
+    #
+    # The race: ``conversation_compression.py`` rotates ``agent.session_id``
+    # as a side effect of a successful compression (end old session, create
+    # new). That mutation is local to the AIAgent instance — but ``state.db``
+    # is shared across all instances. Two AIAgents that share the same
+    # ``session_id`` at the moment they both decide to compress (most
+    # commonly the parent turn's agent + a background-review fork started
+    # right after the turn ended) each end the parent and create their own
+    # NEW session, parented to the same old id. The gateway SessionEntry
+    # only catches one rotation; the other child silently accumulates
+    # writes — Damien's "parent → two orphan children" repro shape.
+    #
+    # The lock is keyed by ``session_id`` and is held for the duration of
+    # the compress() call plus the rotation. ``holder`` identifies the
+    # current owner (pid:tid:nonce) for diagnostics; the lock is recovered
+    # via ``expires_at`` if the holder process crashed without releasing.
+    def try_acquire_compression_lock(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Try to atomically acquire the compression lock for ``session_id``.
+
+        Returns ``True`` on success (caller now owns the lock and must
+        release via :meth:`release_compression_lock`).  Returns ``False``
+        if another holder already owns a non-expired lock — the caller
+        MUST NOT proceed with compression in that case (its rotation would
+        race against the holder's, splitting the session lineage).
+
+        Expired locks (``expires_at < now``) are reclaimed transparently:
+        the stale row is deleted and the new holder acquires it. This
+        prevents a crashed compressor from permanently blocking the
+        session.
+
+        Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
+        followed by a SELECT to confirm we got the row. SQLite serialises
+        writes, so the whole sequence is atomic against other writers.
+
+        ``mode`` is 'INTERACTIVE' or 'BACKGROUND'. Background holders must
+        call :meth:`renew_compression_lock_heartbeat` periodically.
+        """
+        if not session_id:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            # First: reclaim any expired lock for this session_id.
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            # Then: try to insert. INSERT OR IGNORE returns no rowcount
+            # difference — verify ownership via SELECT.
+            conn.execute(
+                "INSERT OR IGNORE INTO compression_locks "
+                "(session_id, holder, mode, acquired_at, expires_at, heartbeat_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, holder, mode, now, expires_at, now),
+            )
+            row = conn.execute(
+                "SELECT holder FROM compression_locks WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == holder
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "try_acquire_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+            # Fail closed: an SQL error must not allow compression to proceed.
+            return False
+
+    def try_acquire_compression_lock(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Convenience wrapper that always uses INTERACTIVE mode."""
+        return self.try_acquire_compression_lock_v2(
+            session_id, holder, ttl_seconds=ttl_seconds, mode='INTERACTIVE'
+        )
+
+    def try_acquire_compression_lock_v2(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+        mode: str = 'INTERACTIVE',
+    ) -> bool:
+        """Try to atomically acquire the compression lock for ``session_id``.
+
+        V2 adds mode tracking and fail-closed behavior on SQL errors.
+        """
+        return self._try_acquire_compression_lock_internal(
+            session_id, holder, ttl_seconds=ttl_seconds, mode=mode
+        )
+
+    def _try_acquire_compression_lock_internal(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+        mode: str = 'INTERACTIVE',
+    ) -> bool:
+        """Internal atomic lock acquisition implementation."""
+        if not session_id:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO compression_locks "
+                "(session_id, holder, mode, acquired_at, expires_at, heartbeat_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, holder, mode, now, expires_at, now),
+            )
+            row = conn.execute(
+                "SELECT holder FROM compression_locks WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == holder
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "try_acquire_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+            # Fail closed: an SQL error must not allow compression to proceed.
+            return False
+
+    def release_compression_lock(self, session_id: str, holder: str) -> None:
+        """Release the compression lock for ``session_id`` iff we own it.
+
+        Idempotent: no-op when the lock has already expired and been
+        reclaimed by a different holder, or when no lock exists. The
+        ``holder`` check prevents a late-returning compressor from
+        clobbering a fresh lock held by someone else.
+        """
+        if not session_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND holder = ?",
+                (session_id, holder),
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "release_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+
+    def renew_compression_lock_heartbeat(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Extend a background lock's expires_at and set heartbeat_at to now.
+
+        Only succeeds if the current holder matches. Returns True on success.
+        """
+        if not session_id or not holder:
+            return False
+        now = time.time()
+        new_expires = now + ttl_seconds
+
+        def _do(conn):
+            # Decide success from THIS statement's rowcount, not the
+            # connection's cumulative total_changes — a non-owner's UPDATE
+            # matches 0 rows but total_changes is inflated by prior writes.
+            cur = conn.execute(
+                "UPDATE compression_locks "
+                "SET heartbeat_at = ?, expires_at = ? "
+                "WHERE session_id = ? AND holder = ?",
+                (now, new_expires, session_id, holder),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("renew_compression_lock_heartbeat failed: %s", exc)
+            return False
+
+    def steal_expired_compression_lock(
+        self,
+        session_id: str,
+        new_holder: str,
+        ttl_seconds: float = 300.0,
+        require_heartbeat_stall: bool = False,
+        heartbeat_stall_seconds: float = 60.0,
+        mode: str = 'INTERACTIVE',
+    ) -> bool:
+        """Reclaim a stalled lock from a dead/unresponsive holder.
+
+        If ``require_heartbeat_stall`` is True, the lock is only stolen
+        when ``now - heartbeat_at > heartbeat_stall_seconds``. Otherwise any
+        lock whose ``expires_at < now`` is reclaimed. The new holder gets a
+        fresh lock with the requested TTL and mode.
+        """
+        if not session_id or not new_holder:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            if require_heartbeat_stall:
+                conn.execute(
+                    "DELETE FROM compression_locks "
+                    "WHERE session_id = ? "
+                    "AND (heartbeat_at IS NULL OR (? - heartbeat_at) > ?)",
+                    (session_id, now, heartbeat_stall_seconds),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM compression_locks "
+                    "WHERE session_id = ? AND expires_at < ?",
+                    (session_id, now),
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO compression_locks "
+                "(session_id, holder, mode, acquired_at, expires_at, heartbeat_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, new_holder, mode, now, expires_at, now),
+            )
+            row = conn.execute(
+                "SELECT holder FROM compression_locks WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == new_holder
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("steal_expired_compression_lock failed: %s", exc)
+            return False
+
+    def get_compression_lock_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return lock info (holder, mode, expires_at, heartbeat_at) or None."""
+        if not session_id:
+            return None
+        row = self._conn.execute(
+            "SELECT holder, mode, expires_at, heartbeat_at "
+            "FROM compression_locks WHERE session_id = ? AND expires_at >= ?",
+            (session_id, time.time()),
+        ).fetchone()
+        if row is None:
+            return None
+        if isinstance(row, sqlite3.Row):
+            return {
+                "holder": row["holder"],
+                "mode": row["mode"],
+                "expires_at": row["expires_at"],
+                "heartbeat_at": row["heartbeat_at"],
+            }
+        return {
+            "holder": row[0],
+            "mode": row[1],
+            "expires_at": row[2],
+            "heartbeat_at": row[3],
+        }
+
+    def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
+        """Return the current (non-expired) holder for ``session_id``, or None.
+
+        Diagnostic helper — not used by the locking protocol itself.
+        """
+        if not session_id:
+            return None
+        now = time.time()
+        row = self._conn.execute(
+            "SELECT holder FROM compression_locks "
+            "WHERE session_id = ? AND expires_at >= ?",
+            (session_id, now),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # RT-02: Compression lineage
+    # ──────────────────────────────────────────────────────────────────────
+
+    def insert_compression_lineage(
+        self,
+        child_session_id: str,
+        parent_session_id: str,
+        strategy: str,
+        trigger: str,
+        tokens_before: int,
+        tokens_after: int,
+        content_hash: str,
+        rollback_token: str,
+    ) -> bool:
+        """Insert a compression lineage record. Returns True on success."""
+        if not child_session_id or not parent_session_id:
+            return False
+        now = time.time()
+        def _do(conn):
+            # Decide success from THIS statement's rowcount, not the
+            # connection's cumulative total_changes — INSERT OR IGNORE on a
+            # duplicate child_session_id inserts 0 rows but total_changes is
+            # inflated by prior writes on the connection, so it would wrongly
+            # report True.
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO compression_lineage "
+                "(child_session_id, parent_session_id, strategy, trigger, "
+                "tokens_before, tokens_after, content_hash, rollback_token, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (child_session_id, parent_session_id, strategy, trigger,
+                 tokens_before, tokens_after, content_hash, rollback_token, now),
+            )
+            return cur.rowcount > 0
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("insert_compression_lineage failed: %s", exc)
+            return False
+
+    def get_compression_lineage(self, session_id: str) -> list:
+        """Return lineage chain for a session (list of dicts, oldest first)."""
+        if not session_id:
+            return []
+        rows = self._conn.execute(
+            "SELECT child_session_id, parent_session_id, strategy, trigger, "
+            "tokens_before, tokens_after, content_hash, rollback_token, created_at "
+            "FROM compression_lineage "
+            "WHERE parent_session_id = ? ORDER BY created_at ASC",
+            (session_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            if isinstance(row, sqlite3.Row):
+                result.append(dict(row))
+            else:
+                result.append({
+                    "child_session_id": row[0],
+                    "parent_session_id": row[1],
+                    "strategy": row[2],
+                    "trigger": row[3],
+                    "tokens_before": row[4],
+                    "tokens_after": row[5],
+                    "content_hash": row[6],
+                    "rollback_token": row[7],
+                    "created_at": row[8],
+                })
+        return result
+
+    def get_compression_tip(self, session_id: str) -> Optional[str]:
+        """Return the tip of the compression chain for session_id.
+
+        Prefers the authoritative ``compression_lineage`` table (written by
+        ``insert_compression_lineage``): follows its child links as far as they
+        go. From wherever lineage ends, falls back to the
+        ``sessions.parent_session_id`` / ``end_reason='compression'``
+        continuation walk so continuations not recorded in the lineage table are
+        still resolved. Cycle detection prevents infinite loops.
+
+        (Previously a second same-named method shadowed this one, so lineage
+        records were never consulted for tip resolution — bug Hunt-3 H3-20.)
+        """
+        if not session_id:
+            return session_id
+        visited = set()
+        current = session_id
+        while current and current not in visited:
+            visited.add(current)
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT child_session_id FROM compression_lineage "
+                    "WHERE parent_session_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (current,),
+                ).fetchone()
+            if row is None:
+                break
+            child = row[0]
+            if not child or child in visited:
+                break
+            current = child
+        # Continue/fall back via the sessions-based continuation chain.
+        return self._compression_tip_via_sessions(current)
+
+    def detect_orphan_children(self, session_id: str) -> list:
+        """Detect orphan child sessions created by split-brain compression.
+
+        Returns list of session_ids that have session_id as parent but are
+        NOT in the compression_lineage table (i.e. they were created by a
+        competing compressor that lost the race).
+        """
+        if not session_id:
+            return []
+        rows = self._conn.execute(
+            "SELECT s.id FROM sessions s "
+            "WHERE s.parent_session_id = ? "
+            "AND s.id NOT IN (SELECT child_session_id FROM compression_lineage WHERE parent_session_id = ?) "
+            "AND s.started_at >= (SELECT ended_at FROM sessions WHERE id = ?) "
+            "ORDER BY s.started_at ASC",
+            (session_id, session_id, session_id),
+        ).fetchall()
+        return [r[0] if isinstance(r, sqlite3.Row) else r[0] for r in rows]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # RT-02: Checkpoints & Rollback
+    # ──────────────────────────────────────────────────────────────────────
+
+    # ── Execution ledger (file-grounded state that survives compression) ──
+    # The agent loses its working-tree memory at a context-compression boundary:
+    # the transcript is summarized away and TodoStore.format_for_injection drops
+    # completed items. On a long multi-file task that means re-editing a file it
+    # already fixed or skipping verification it already ran. These methods persist
+    # a durable per-(session,path) record of file mutations, re-injected in full
+    # after compression so finished file work is never silently redone.
+
+    def record_file_mutation(
+        self,
+        session_id: str,
+        path: str,
+        action: str,
+        summary: Optional[str] = None,
+    ) -> bool:
+        """Upsert a file mutation into the execution ledger. Best-effort.
+
+        One row per (session_id, path); a repeat edit bumps ``edit_count`` and
+        refreshes ``updated_at``/``action`` rather than inserting a duplicate.
+        Never raises — a ledger write must never break tool execution.
+        """
+        if not session_id or not path:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            cur = conn.execute(
+                "INSERT INTO execution_ledger "
+                "(session_id, path, action, summary, edit_count, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?) "
+                "ON CONFLICT(session_id, path) DO UPDATE SET "
+                "  edit_count = edit_count + 1, "
+                "  action = excluded.action, "
+                "  summary = COALESCE(excluded.summary, execution_ledger.summary), "
+                "  updated_at = excluded.updated_at",
+                (session_id, path, action, summary, now, now),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("record_file_mutation failed: %s", exc)
+            return False
+
+    def get_execution_ledger(
+        self, session_id: str, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Return ledger rows for a session, most-recently-updated first."""
+        if not session_id:
+            return []
+        try:
+            with self._lock:
+                cursor = self._conn.execute(
+                    "SELECT path, action, summary, edit_count, updated_at "
+                    "FROM execution_ledger WHERE session_id = ? "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    (session_id, int(limit)),
+                )
+                rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as exc:
+            logger.warning("get_execution_ledger failed: %s", exc)
+            return []
+
+    def _ledger_rows_with_lineage(self, fetch, session_id: str, limit: int):
+        """Fetch ledger rows for ``session_id``; if it has none, walk the
+        compression-parent chain (``sessions.parent_session_id``) for the nearest
+        ancestor that does. Returns ``(rows, resolved_session_id)``. Bounded and
+        cycle-safe; self-heals a missed carry_forward and the gate-enabled-mid-task
+        cold start. Shared by the file and verification ledgers.
+        """
+        rows = fetch(session_id, limit=limit)
+        if rows:
+            return rows, session_id
+        seen = {session_id}
+        cur = session_id
+        for _ in range(25):
+            try:
+                row = self.get_session(cur)
+            except Exception:
+                row = None
+            parent = row.get("parent_session_id") if row else None
+            if not parent or parent in seen:
+                break
+            seen.add(parent)
+            rows = fetch(parent, limit=limit)
+            if rows:
+                return rows, parent
+            cur = parent
+        return [], session_id
+
+    def _latest_file_mutation_ts(self, session_id: str) -> float:
+        """Most recent execution_ledger.updated_at for a session (0.0 if none).
+
+        Used to flag a verification as STALE — a check that ran before the latest
+        file change can no longer be trusted as proof the current code is green.
+        """
+        if not session_id:
+            return 0.0
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT MAX(updated_at) FROM execution_ledger WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        except sqlite3.Error:
+            return 0.0
+
+    def format_execution_ledger_for_injection(
+        self, session_id: str, limit: int = 40
+    ) -> Optional[str]:
+        """Render the execution ledger for post-compression injection, or None.
+
+        Mirrors ``TodoStore.format_for_injection`` but re-injects the FULL set of
+        modified files (not just "active" ones): the whole point is to stop the
+        model recreating or re-editing files it already finished once the
+        transcript that recorded that work has been compressed away.
+        """
+        rows, _ = self._ledger_rows_with_lineage(
+            self.get_execution_ledger, session_id, limit
+        )
+        if not rows:
+            return None
+        lines = [
+            "[Files you have already modified earlier in this task — preserved "
+            "across context compression. Do NOT recreate or re-edit them from "
+            "scratch; touch one again only if a further change is genuinely needed.]"
+        ]
+        for r in rows:
+            count = r.get("edit_count") or 1
+            times = "" if count <= 1 else f" ({count}× edits)"
+            summary = f" — {r['summary']}" if r.get("summary") else ""
+            lines.append(f"- {r['path']}{times}{summary}")
+        return "\n".join(lines)
+
+    def carry_forward_execution_ledger(
+        self, old_session_id: str, new_session_id: str
+    ) -> bool:
+        """Re-key ledger rows when compression rotates the session id.
+
+        Context compression ends the old session and assigns a fresh
+        ``session_id``; without this the post-compression injection would look up
+        the new id and find nothing — exactly when the history matters most. The
+        UPDATE moves (not copies) rows, so the ledger stays a single accumulating
+        set across arbitrarily many compressions. ``OR IGNORE`` drops the rare
+        row whose path already exists under the new id. Best-effort.
+        """
+        if (
+            not old_session_id
+            or not new_session_id
+            or old_session_id == new_session_id
+        ):
+            return False
+
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE OR IGNORE execution_ledger SET session_id = ? "
+                "WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            return cur.rowcount
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("carry_forward_execution_ledger failed: %s", exc)
+            return False
+
+    def prune_execution_ledger(self, max_age_days: float = 14.0) -> int:
+        """Delete execution-ledger rows older than ``max_age_days``. Best-effort.
+
+        The table intentionally has no FK (carry_forward re-keys to a successor id
+        before that session row exists, and a cascade must never drop in-flight
+        rows), so it needs its own janitor. Age-based pruning bounds growth and
+        clears orphan rows left by ephemeral child/subagent sessions that are
+        never carried forward — while never touching a live task's fresh rows.
+        """
+        cutoff = time.time() - max_age_days * 86400.0
+
+        def _do(conn):
+            n = conn.execute(
+                "DELETE FROM execution_ledger WHERE updated_at < ?", (cutoff,)
+            ).rowcount
+            n += conn.execute(
+                "DELETE FROM verification_ledger WHERE updated_at < ?", (cutoff,)
+            ).rowcount
+            return n
+
+        try:
+            return int(self._execute_write(_do) or 0)
+        except sqlite3.Error as exc:
+            logger.warning("prune_execution_ledger failed: %s", exc)
+            return 0
+
+    # ── Verification ledger (what you PROVED, surviving compression) ──────
+    # The execution_ledger remembers what files changed; this remembers what
+    # checks ran. After compression the agent otherwise forgets it was verifying
+    # and may declare DONE on "file patched" alone. Records are re-injected with
+    # a re-run reminder and a STALE marker, so a pre-compression PASS never
+    # licenses skipping re-verification. Same FK-less/carry-forward/prune contract.
+
+    def record_verification(
+        self,
+        session_id: str,
+        command: str,
+        exit_code: Optional[int] = None,
+        output_snippet: Optional[str] = None,
+    ) -> bool:
+        """Upsert a verification command into the ledger. Best-effort, never raises.
+
+        ``passed`` is derived from ``exit_code`` when known (0 → pass), else NULL
+        (unknown — the command is still recorded so the agent remembers it ran).
+        ``output_snippet`` is the tail of a FAILED check's output (the traceback /
+        assertion) so the agent recovers WHY it failed across compression instead
+        of re-running to re-derive it.
+        """
+        if not session_id or not command:
+            return False
+        passed = None if exit_code is None else (1 if exit_code == 0 else 0)
+        now = time.time()
+
+        def _do(conn):
+            cur = conn.execute(
+                "INSERT INTO verification_ledger "
+                "(session_id, command, exit_code, passed, output_snippet, run_count, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?) "
+                "ON CONFLICT(session_id, command) DO UPDATE SET "
+                "  run_count = run_count + 1, "
+                # COALESCE so a re-run whose exit code couldn't be parsed (unknown
+                # = NULL) preserves the last KNOWN verdict instead of wiping it —
+                # losing a known PASS/FAIL across compression would defeat the
+                # ledger's one job. A real exit code (0 or non-zero) still wins.
+                "  exit_code = COALESCE(excluded.exit_code, verification_ledger.exit_code), "
+                "  passed = COALESCE(excluded.passed, verification_ledger.passed), "
+                # Snippet tracks the verdict: when the new run has a KNOWN exit code
+                # its snippet wins (a fresh pass clears the old traceback to NULL; a
+                # fresh fail replaces it); an UNKNOWN re-run preserves the last one.
+                "  output_snippet = CASE WHEN excluded.exit_code IS NULL "
+                "    THEN verification_ledger.output_snippet ELSE excluded.output_snippet END, "
+                "  updated_at = excluded.updated_at",
+                (session_id, command, exit_code, passed, output_snippet, now, now),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("record_verification failed: %s", exc)
+            return False
+
+    def get_verification_ledger(
+        self, session_id: str, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Return verification rows for a session, most-recently-run first."""
+        if not session_id:
+            return []
+        try:
+            with self._lock:
+                cursor = self._conn.execute(
+                    "SELECT command, exit_code, passed, output_snippet, run_count, updated_at "
+                    "FROM verification_ledger WHERE session_id = ? "
+                    "ORDER BY updated_at DESC LIMIT ?",
+                    (session_id, int(limit)),
+                )
+                rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as exc:
+            logger.warning("get_verification_ledger failed: %s", exc)
+            return []
+
+    def format_verification_for_injection(
+        self, session_id: str, limit: int = 40
+    ) -> Optional[str]:
+        """Render the verification ledger for post-compression injection, or None.
+
+        Safe-by-design against stale evidence: each check is flagged STALE when a
+        file was modified after it ran, and the header mandates re-running per the
+        Definition of Done. A pre-compression PASS is never presented as current
+        proof — it only reminds the agent what it already checked and how.
+        """
+        rows, _vsid = self._ledger_rows_with_lineage(
+            self.get_verification_ledger, session_id, limit
+        )
+        if not rows:
+            return None
+        # Staleness must compare against the FILE ledger's OWN resolved session.
+        # The two ledgers can land under different ids when one carry_forward
+        # succeeds and the other fails; computing latest_file against the
+        # verification's session (which may then hold no file rows) would yield 0
+        # and falsely report a stale check as "current" — the one outcome this
+        # safety marker exists to prevent. Resolve file mutations independently.
+        _frows, fsid = self._ledger_rows_with_lineage(
+            self.get_execution_ledger, session_id, 1
+        )
+        latest_file = self._latest_file_mutation_ts(fsid)
+        lines = [
+            "[Checks you have run earlier this task (preserved across context "
+            "compression). Per your Definition of Done, RE-RUN the relevant ones to "
+            "confirm the CURRENT code is green before declaring done — a pre-"
+            "compression pass is not proof. Items marked STALE had a file change "
+            "after they ran.]"
+        ]
+        snippet_budget = 4000  # cap total error-tail text so a many-FAIL session
+        for r in rows:                          # can't bloat every post-compression turn
+            passed = r.get("passed")
+            if passed is None:
+                verdict = ""
+                if r.get("exit_code") is not None:
+                    verdict = f" (exit {r['exit_code']})"
+            else:
+                verdict = " PASS" if passed else " FAIL"
+            stale = (
+                " — STALE (a file changed after this ran; re-run)"
+                if latest_file and r["updated_at"] < latest_file
+                else ""
+            )
+            lines.append(f"- `{r['command']}`{verdict}{stale}")
+            # For a FAIL, surface the diagnostic tail so the agent resumes the
+            # debugging thread instead of re-running the check to re-derive it.
+            if passed == 0 and r.get("output_snippet") and snippet_budget > 0:
+                snippet = " ".join(str(r["output_snippet"]).split())[:400]
+                if snippet:
+                    line = f"    last error: {snippet}"
+                    lines.append(line)
+                    snippet_budget -= len(line)
+        return "\n".join(lines)
+
+    def get_open_verification_failures(
+        self, session_id: str, limit: int = 40, recency_window: float = 1800.0
+    ) -> List[Dict[str, Any]]:
+        """Return verification checks that are currently FAIL or STALE *and recent*.
+
+        FAIL = a recorded non-zero exit; STALE = a file was modified after the
+        check last ran (so even a prior PASS no longer proves the current code).
+        The Definition-of-Done gate uses this to refuse a 'done' finish while a
+        recorded check is red or unverified. Reuses the same lineage + staleness
+        resolution as ``format_verification_for_injection`` (staleness measured
+        against the FILE ledger's own resolved session).
+
+        A ``recency_window`` (seconds, relative to the most recent file/verify
+        activity) bounds "open" to the CURRENT work: a check that failed early in a
+        long multi-task session and was abandoned (never re-run) must not block
+        every later, unrelated final answer. Fail-open: [] on error.
+        """
+        rows, _vsid = self._ledger_rows_with_lineage(
+            self.get_verification_ledger, session_id, limit
+        )
+        if not rows:
+            return []
+        _frows, fsid = self._ledger_rows_with_lineage(
+            self.get_execution_ledger, session_id, 1
+        )
+        latest_file = self._latest_file_mutation_ts(fsid)
+        latest_verify = max((r["updated_at"] for r in rows), default=0.0)
+        cutoff = max(latest_file, latest_verify) - recency_window
+        open_checks: List[Dict[str, Any]] = []
+        for r in rows:
+            if r["updated_at"] < cutoff:
+                continue  # abandoned earlier in the session — not the current work
+            is_fail = r.get("passed") == 0
+            is_stale = bool(latest_file and r["updated_at"] < latest_file)
+            if is_fail or is_stale:
+                open_checks.append(
+                    {"command": r["command"], "passed": r.get("passed"), "stale": is_stale}
+                )
+        return open_checks
+
+    def get_open_test_coverage_gap(
+        self, session_id: str, limit: int = 100, recency_window: float = 1800.0
+    ) -> List[str]:
+        """Return changed SOURCE files when a fix landed with no test added/modified
+        AND a test runner is in use — i.e. a regression-test coverage gap. Empty
+        list when fine (no source change, a test WAS touched, or no runner present).
+
+        Used by the regression-test gate to ask "where's the test?" before finishing.
+        Recency-bounded to the current task; reuses the same lineage resolution as
+        the other gates. Fail-open: [] on error.
+        """
+        rows, _sid = self._ledger_rows_with_lineage(
+            self.get_execution_ledger, session_id, limit
+        )
+        if not rows:
+            return []
+        latest = max((r["updated_at"] for r in rows), default=0.0)
+        cutoff = latest - recency_window
+        recent = [r for r in rows if r["updated_at"] >= cutoff]
+        source_changed = [
+            r["path"] for r in recent
+            if _is_source_code(r["path"])
+        ]
+        touched_a_test = any(_is_test_path(r["path"]) for r in recent)
+        if not source_changed or touched_a_test:
+            return []
+        # Only nudge when a runner ran in THIS task's window — else a stale
+        # verification carried from an earlier task would falsely satisfy the
+        # guard. get_verification_ledger is updated_at DESC, so vrows[0] is the
+        # most recent; require it within the same recency window as the edits.
+        vrows, _vsid = self._ledger_rows_with_lineage(
+            self.get_verification_ledger, session_id, 1
+        )
+        if not vrows or vrows[0]["updated_at"] < cutoff:
+            return []
+        return source_changed
+
+    def carry_forward_verification_ledger(
+        self, old_session_id: str, new_session_id: str
+    ) -> bool:
+        """Re-key verification rows across a compression session-id rotation.
+
+        Mirror of ``carry_forward_execution_ledger`` so verification history
+        accumulates across compressions instead of resetting. Best-effort.
+        """
+        if (
+            not old_session_id
+            or not new_session_id
+            or old_session_id == new_session_id
+        ):
+            return False
+
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE OR IGNORE verification_ledger SET session_id = ? "
+                "WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            return cur.rowcount
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("carry_forward_verification_ledger failed: %s", exc)
+            return False
+
+    def save_compression_checkpoint(
+        self,
+        session_id: str,
+        trigger: str,
+        checkpoint_json: str,
+        rollback_token: str,
+    ) -> bool:
+        """Save a compression checkpoint for later rollback."""
+        if not session_id or not rollback_token:
+            return False
+        now = time.time()
+        def _do(conn):
+            cur = conn.execute(
+                "INSERT OR REPLACE INTO compression_checkpoints "
+                "(session_id, trigger, checkpoint_json, rollback_token, consumed, consumed_at, created_at) "
+                "VALUES (?, ?, ?, ?, 0, NULL, ?)",
+                (session_id, trigger, checkpoint_json, rollback_token, now),
+            )
+            # Decide success from THIS statement's rowcount, not the connection's
+            # cumulative total_changes. INSERT OR REPLACE always affects a row so
+            # the old total_changes guard was accidentally correct, but on a
+            # reused connection total_changes is inflated by prior writes — the
+            # rowcount form is the consistent, refactor-safe predicate.
+            return cur.rowcount > 0
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("save_compression_checkpoint failed: %s", exc)
+            return False
+
+    def consume_rollback_token(self, rollback_token: str) -> Optional[Dict[str, Any]]:
+        """Atomically consume a rollback token and return the checkpoint.
+
+        Marks the checkpoint as consumed (consumed=1, consumed_at=now) so
+        it cannot be reused. Returns the checkpoint dict or None if the
+        token is invalid, already consumed, or not found.
+        """
+        if not rollback_token:
+            return None
+        now = time.time()
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, session_id, trigger, checkpoint_json, rollback_token, consumed "
+                "FROM compression_checkpoints WHERE rollback_token = ?",
+                (rollback_token,),
+            ).fetchone()
+            if row is None:
+                return None
+            consumed = row[5] if not isinstance(row, sqlite3.Row) else row["consumed"]
+            if consumed:
+                return None  # Already consumed
+            cur = conn.execute(
+                "UPDATE compression_checkpoints SET consumed = 1, consumed_at = ? "
+                "WHERE rollback_token = ? AND consumed = 0",
+                (now, rollback_token),
+            )
+            # Decide from THIS statement's rowcount, not the connection's
+            # cumulative total_changes. Under the lost race (a concurrent
+            # consumer flipped consumed to 1 between our SELECT and UPDATE),
+            # the UPDATE matches 0 rows even though total_changes is already
+            # > 0 from the concurrent write — so the total_changes guard never
+            # fired and the loser wrongly reported success.
+            if cur.rowcount == 0:
+                return None  # Lost race
+            if isinstance(row, sqlite3.Row):
+                return {
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "trigger": row["trigger"],
+                    "checkpoint_json": row["checkpoint_json"],
+                    "rollback_token": row["rollback_token"],
+                }
+            return {
+                "id": row[0],
+                "session_id": row[1],
+                "trigger": row[2],
+                "checkpoint_json": row[3],
+                "rollback_token": row[4],
+            }
+        try:
+            return self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning("consume_rollback_token failed: %s", exc)
+            return None
+
+    def get_valid_rollback_target(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the latest unconsumed checkpoint for session_id, or None."""
+        if not session_id:
+            return None
+        row = self._conn.execute(
+            "SELECT id, session_id, trigger, checkpoint_json, rollback_token, consumed, created_at "
+            "FROM compression_checkpoints "
+            "WHERE session_id = ? AND consumed = 0 ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if isinstance(row, sqlite3.Row):
+            return dict(row)
+        return {
+            "id": row[0],
+            "session_id": row[1],
+            "trigger": row[2],
+            "checkpoint_json": row[3],
+            "rollback_token": row[4],
+            "consumed": row[5],
+            "created_at": row[6],
+        }
+
+    # ──────────────────────────────────────────────────────────────────────
+    # RT-02: Idempotency
+    # ──────────────────────────────────────────────────────────────────────
+
+    def check_idempotency_key(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return the cached result for an idempotency key, or None."""
+        if not key:
+            return None
+        row = self._conn.execute(
+            "SELECT key, session_id, trigger, result_json, created_at "
+            "FROM idempotency_keys WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        if isinstance(row, sqlite3.Row):
+            return dict(row)
+        return {
+            "key": row[0],
+            "session_id": row[1],
+            "trigger": row[2],
+            "result_json": row[3],
+            "created_at": row[4],
+        }
+
+    def store_idempotency_key(
+        self,
+        key: str,
+        session_id: str,
+        trigger: str,
+        result_json: str,
+    ) -> bool:
+        """Store an idempotency key with its result. Returns True on success."""
+        if not key or not session_id:
+            return False
+        now = time.time()
+        def _do(conn):
+            # Decide success from THIS statement's rowcount, not the
+            # connection's cumulative total_changes — INSERT OR IGNORE on a
+            # duplicate key inserts 0 rows but total_changes is inflated by
+            # prior writes.
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO idempotency_keys "
+                "(key, session_id, trigger, result_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (key, session_id, trigger, result_json, now),
+            )
+            return cur.rowcount > 0
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("store_idempotency_key failed: %s", exc)
+            return False
+
+    @staticmethod
+    def compute_idempotency_key(
+        session_id: str,
+        trigger: str,
+        content_hash: str,
+        strategy: str,
+        force: bool = False,
+    ) -> str:
+        """Compute a deterministic idempotency key.
+
+        MANUAL_FORCE bypasses content_hash (uses a unique nonce suffix)
+        so forced compressions are never deduplicated.
+        """
+        import hashlib
+        if force:
+            import uuid
+            return f"{session_id}:{trigger}:{strategy}:FORCE:{uuid.uuid4().hex[:8]}"
+        raw = f"{session_id}:{trigger}:{content_hash}:{strategy}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # RT-02: Session mutation CAS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def try_claim_session_mutation(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Atomically claim the right to mutate a session.
+
+        Uses UPDATE WHERE in_progress=0 for atomic CAS. Returns True if
+        the caller wins the claim, False if another holder already has it.
+        """
+        if not session_id or not holder:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+        def _do(conn):
+            # Reclaim expired claims
+            conn.execute(
+                "DELETE FROM session_mutation "
+                "WHERE session_id = ? AND expires_at IS NOT NULL AND expires_at < ?",
+                (session_id, now),
+            )
+            # Atomic CAS: UPDATE only if in_progress=0
+            conn.execute(
+                "INSERT OR IGNORE INTO session_mutation (session_id, in_progress, holder, acquired_at, expires_at) "
+                "VALUES (?, 0, NULL, NULL, NULL)",
+                (session_id,),
+            )
+            conn.execute(
+                "UPDATE session_mutation SET in_progress = 1, holder = ?, acquired_at = ?, expires_at = ? "
+                "WHERE session_id = ? AND in_progress = 0",
+                (holder, now, expires_at, session_id),
+            )
+            row = conn.execute(
+                "SELECT holder FROM session_mutation WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == holder
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("try_claim_session_mutation failed: %s", exc)
+            return False
+
+    def release_session_mutation(self, session_id: str, holder: str) -> None:
+        """Release a session mutation claim."""
+        if not session_id:
+            return
+        def _do(conn):
+            conn.execute(
+                "UPDATE session_mutation SET in_progress = 0, holder = NULL, acquired_at = NULL, expires_at = NULL "
+                "WHERE session_id = ? AND holder = ?",
+                (session_id, holder),
+            )
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning("release_session_mutation failed: %s", exc)
+
+    def get_session_mutation_holder(self, session_id: str) -> Optional[str]:
+        """Return the current mutation holder for session_id, or None."""
+        if not session_id:
+            return None
+        row = self._conn.execute(
+            "SELECT holder FROM session_mutation WHERE session_id = ? AND in_progress = 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # RT-02: Lineage version
+    # ──────────────────────────────────────────────────────────────────────
+
+    def increment_lineage_version(self, session_id: str) -> bool:
+        """Increment the lineage_version counter for a session."""
+        if not session_id:
+            return False
+        def _do(conn):
+            # Decide success from THIS statement's rowcount, not the
+            # connection's cumulative total_changes — an UPDATE against a
+            # non-existent session matches 0 rows but total_changes is
+            # inflated by prior writes.
+            cur = conn.execute(
+                "UPDATE sessions SET lineage_version = lineage_version + 1 WHERE id = ?",
+                (session_id,),
+            )
+            return cur.rowcount > 0
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("increment_lineage_version failed: %s", exc)
+            return False
+
+    def get_lineage_version(self, session_id: str) -> int:
+        """Return the lineage_version for a session, or 0."""
+        if not session_id:
+            return 0
+        row = self._conn.execute(
+            "SELECT lineage_version FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return 0
+        return row[0] if not isinstance(row, sqlite3.Row) else row["lineage_version"]
+
+    def update_session_meta(
+        self,
+        session_id: str,
+        model_config_json: str,
+        model: Optional[str] = None,
+    ) -> None:
+        """Update model_config and optionally model for an existing session.
+
+        Uses COALESCE so that passing model=None leaves the stored model
+        column unchanged.  Routes through _execute_write for the standard
+        BEGIN IMMEDIATE + jitter-retry + lock guarantee.
+        """
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
+                (model_config_json, model, session_id),
+            )
+        self._execute_write(_do)
+
+    def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
+        """Store the full assembled system prompt snapshot."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET system_prompt = ? WHERE id = ?",
+                (system_prompt, session_id),
+            )
+        self._execute_write(_do)
+
+    def update_session_model(self, session_id: str, model: str) -> None:
+        """Update the model for a session after a mid-session switch.
+
+        Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
+        (only filling in NULL), this unconditionally sets the model column
+        so that the dashboard reflects the user's latest /model choice.
+        """
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET model = ? WHERE id = ?",
+                (model, session_id),
+            )
+        self._execute_write(_do)
+
+    def update_token_counts(
+        self,
+        session_id: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model: str = None,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
+        pricing_version: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
+        api_call_count: int = 0,
+        absolute: bool = False,
+    ) -> None:
+        """Update token counters and backfill model if not already set.
+
+        When *absolute* is False (default), values are **incremented** — use
+        this for per-API-call deltas (CLI path).
+
+        When *absolute* is True, values are **set directly** — use this when
+        the caller already holds cumulative totals (gateway path, where the
+        cached agent accumulates across messages).
+        """
+        # Ensure the session row exists so the UPDATE doesn't silently affect
+        # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
+        # initial create_session() may have failed due to SQLite locking.
+        # INSERT OR IGNORE is cheap and idempotent.
+        self._insert_session_row(session_id, "unknown", model=model)
+        if absolute:
+            sql = """UPDATE sessions SET
+                   input_tokens = ?,
+                   output_tokens = ?,
+                   cache_read_tokens = ?,
+                   cache_write_tokens = ?,
+                   reasoning_tokens = ?,
+                   estimated_cost_usd = COALESCE(?, 0),
+                   actual_cost_usd = CASE
+                       WHEN ? IS NULL THEN actual_cost_usd
+                       ELSE ?
+                   END,
+                   cost_status = COALESCE(?, cost_status),
+                   cost_source = COALESCE(?, cost_source),
+                   pricing_version = COALESCE(?, pricing_version),
+                   billing_provider = COALESCE(billing_provider, ?),
+                   billing_base_url = COALESCE(billing_base_url, ?),
+                   billing_mode = COALESCE(billing_mode, ?),
+                   model = COALESCE(model, ?),
+                   api_call_count = ?
+                   WHERE id = ?"""
+        else:
+            sql = """UPDATE sessions SET
+                   input_tokens = input_tokens + ?,
+                   output_tokens = output_tokens + ?,
+                   cache_read_tokens = cache_read_tokens + ?,
+                   cache_write_tokens = cache_write_tokens + ?,
+                   reasoning_tokens = reasoning_tokens + ?,
+                   estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
+                   actual_cost_usd = CASE
+                       WHEN ? IS NULL THEN actual_cost_usd
+                       ELSE COALESCE(actual_cost_usd, 0) + ?
+                   END,
+                   cost_status = COALESCE(?, cost_status),
+                   cost_source = COALESCE(?, cost_source),
+                   pricing_version = COALESCE(?, pricing_version),
+                   billing_provider = COALESCE(billing_provider, ?),
+                   billing_base_url = COALESCE(billing_base_url, ?),
+                   billing_mode = COALESCE(billing_mode, ?),
+                   model = COALESCE(model, ?),
+                   api_call_count = COALESCE(api_call_count, 0) + ?
+                   WHERE id = ?"""
+        params = (
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            estimated_cost_usd,
+            actual_cost_usd,
+            actual_cost_usd,
+            cost_status,
+            cost_source,
+            pricing_version,
+            billing_provider,
+            billing_base_url,
+            billing_mode,
+            model,
+            api_call_count,
+            session_id,
+        )
+        def _do(conn):
+            conn.execute(sql, params)
+        self._execute_write(_do)
+
+    def ensure_session(
+        self,
+        session_id: str,
+        source: str = "unknown",
+        model: str = None,
+        **kwargs,
+    ) -> str:
+        """Ensure a session row exists (INSERT OR IGNORE). Accepts optional kwargs."""
+        self._insert_session_row(session_id, source, model=model, **kwargs)
+        return session_id
+
+    def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
+        """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
+        cutoff = time.time() - 86400  # Only sessions older than 24 hours
+
+        def _do(conn):
+            rows = conn.execute("""
+                SELECT id FROM sessions
+                WHERE source = 'tui'
+                  AND title IS NULL
+                  AND ended_at IS NOT NULL
+                  AND started_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                  )
+            """, (cutoff,)).fetchall()
+            ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
+                )
+            return ids
+
+        removed_ids = self._execute_write(_do) or []
+        # Clean up any on-disk session files (belt-and-suspenders)
+        if sessions_dir and removed_ids:
+            for sid in removed_ids:
+                self._remove_session_files(sessions_dir, sid)
+        return len(removed_ids)
+
+    def finalize_orphaned_compression_sessions(self) -> int:
+        """Mark orphaned compression continuation sessions as ended.
+
+        Targets child sessions that were never finalized: parent is ended
+        with reason='compression', child has messages but no end_reason/ended_at
+        and api_call_count=0.  Non-destructive: preserves all messages and sets
+        end_reason='orphaned_compression'.  Fix for #20001.
+        """
+        cutoff = time.time() - 604800  # 7 days
+
+        def _do(conn):
+            now = time.time()
+            result = conn.execute(
+                """
+                UPDATE sessions
+                SET ended_at = ?,
+                    end_reason = 'orphaned_compression'
+                WHERE api_call_count = 0
+                  AND end_reason IS NULL
+                  AND ended_at IS NULL
+                  AND started_at < ?
+                  AND parent_session_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM sessions p
+                      WHERE p.id = sessions.parent_session_id
+                        AND p.end_reason = 'compression'
+                        AND p.ended_at IS NOT NULL
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM messages m
+                      WHERE m.session_id = sessions.id
+                  )
+                """,
+                (now, cutoff),
+            )
+            return result.rowcount
+
+        return self._execute_write(_do) or 0
+
+    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get a session by ID."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
+        """Resolve an exact or uniquely prefixed session ID to the full ID.
+
+        Returns the exact ID when it exists. Otherwise treats the input as a
+        prefix and returns the single matching session ID if the prefix is
+        unambiguous. Returns None for no matches or ambiguous prefixes.
+        """
+        exact = self.get_session(session_id_or_prefix)
+        if exact:
+            return exact["id"]
+
+        escaped = (
+            session_id_or_prefix
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
+                (f"{escaped}%",),
+            )
+            matches = [row["id"] for row in cursor.fetchall()]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    # Maximum length for session titles
+    MAX_TITLE_LENGTH = 100
+
+    @staticmethod
+    def sanitize_title(title: Optional[str]) -> Optional[str]:
+        """Validate and sanitize a session title.
+
+        - Strips leading/trailing whitespace
+        - Removes ASCII control characters (0x00-0x1F, 0x7F) and problematic
+          Unicode control chars (zero-width, RTL/LTR overrides, etc.)
+        - Collapses internal whitespace runs to single spaces
+        - Normalizes empty/whitespace-only strings to None
+        - Enforces MAX_TITLE_LENGTH
+
+        Returns the cleaned title string or None.
+        Raises ValueError if the title exceeds MAX_TITLE_LENGTH after cleaning.
+        """
+        if not title:
+            return None
+
+        # Remove ASCII control characters (0x00-0x1F, 0x7F) but keep
+        # whitespace chars (\t=0x09, \n=0x0A, \r=0x0D) so they can be
+        # normalized to spaces by the whitespace collapsing step below
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
+
+        # Remove problematic Unicode control characters:
+        # - Zero-width chars (U+200B-U+200F, U+FEFF)
+        # - Directional overrides (U+202A-U+202E, U+2066-U+2069)
+        # - Object replacement (U+FFFC), interlinear annotation (U+FFF9-U+FFFB)
+        cleaned = re.sub(
+            r'[\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffc\ufff9-\ufffb]',
+            '', cleaned,
+        )
+
+        # Collapse internal whitespace runs and strip
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        if not cleaned:
+            return None
+
+        if len(cleaned) > SessionDB.MAX_TITLE_LENGTH:
+            raise ValueError(
+                f"Title too long ({len(cleaned)} chars, max {SessionDB.MAX_TITLE_LENGTH})"
+            )
+
+        return cleaned
+
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """Set or update a session's title.
+
+        Returns True if session was found and title was set.
+        Raises ValueError if title is already in use by another session,
+        or if the title fails validation (too long, invalid characters).
+        Empty/whitespace-only strings are normalized to None (clearing the title).
+        """
+        title = self.sanitize_title(title)
+        def _do(conn):
+            if title:
+                # Check uniqueness (allow the same session to keep its own title)
+                cursor = conn.execute(
+                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                    (title, session_id),
+                )
+                conflict = cursor.fetchone()
+                if conflict:
+                    raise ValueError(
+                        f"Title '{title}' is already in use by session {conflict['id']}"
+                    )
+            cursor = conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                (title, session_id),
+            )
+            return cursor.rowcount
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def get_session_title(self, session_id: str) -> Optional[str]:
+        """Get the title for a session, or None."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT title FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = cursor.fetchone()
+        return row["title"] if row else None
+
+    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        """Archive or unarchive a session.
+
+        Archived sessions are hidden from the default session list but keep all
+        their messages — this is a soft hide, not a delete. For compression
+        chains, archive the whole logical conversation. Desktop lists compression
+        roots projected forward to their latest continuation; updating only the
+        displayed tip lets the still-unarchived root resurrect it on refresh.
+        Returns True when at least one row was updated.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                      AND child.started_at >= parent.ended_at
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                      AND child.started_at >= parent.ended_at
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET archived = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, 1 if archived else 0),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            return rowcount
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+        """Look up a session by exact title. Returns session dict or None."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM sessions WHERE title = ?", (title,)
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def resolve_session_by_title(self, title: str) -> Optional[str]:
+        """Resolve a title to a session ID, preferring the latest in a lineage.
+
+        If the exact title exists, returns that session's ID.
+        If not, searches for "title #N" variants and returns the latest one.
+        If the exact title exists AND numbered variants exist, returns the
+        latest numbered variant (the most recent continuation).
+        """
+        # First try exact match
+        exact = self.get_session_by_title(title)
+
+        # Also search for numbered variants: "title #2", "title #3", etc.
+        # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT id, title, started_at FROM sessions "
+                "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
+                (f"{escaped} #%",),
+            )
+            numbered = cursor.fetchall()
+
+        if numbered:
+            # Return the most recent numbered variant
+            return numbered[0]["id"]
+        elif exact:
+            return exact["id"]
+        return None
+
+    def get_next_title_in_lineage(self, base_title: str) -> str:
+        """Generate the next title in a lineage (e.g., "my session" → "my session #2").
+
+        Strips any existing " #N" suffix to find the base name, then finds
+        the highest existing number and increments.
+        """
+        # Strip existing #N suffix to find the true base
+        match = re.match(r'^(.*?) #(\d+)$', base_title)
+        if match:
+            base = match.group(1)
+        else:
+            base = base_title
+
+        # Find all existing numbered variants
+        # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
+        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
+                (base, f"{escaped} #%"),
+            )
+            existing = [row["title"] for row in cursor.fetchall()]
+
+        if not existing:
+            return base  # No conflict, use the base name as-is
+
+        # Find the highest number
+        max_num = 1  # The unnumbered original counts as #1
+        for t in existing:
+            m = re.match(r'^.* #(\d+)$', t)
+            if m:
+                max_num = max(max_num, int(m.group(1)))
+
+        return f"{base} #{max_num + 1}"
+
+    def _compression_tip_via_sessions(self, session_id: str) -> Optional[str]:
+        """Walk the compression-continuation chain forward and return the tip.
+
+        A compression continuation is a child session where:
+        1. The parent's ``end_reason = 'compression'``
+        2. The child was created AFTER the parent was ended (started_at >= ended_at)
+
+        The second condition distinguishes compression continuations from
+        delegate subagents or branch children, which can also have a
+        ``parent_session_id`` but were created while the parent was still live.
+
+        Returns the session_id of the latest continuation in the chain, or the
+        input ``session_id`` if it isn't part of a compression chain (or if the
+        input itself doesn't exist).
+        """
+        current = session_id
+        # Bound the walk defensively — compression chains this deep are
+        # pathological and shouldn't happen in practice. 100 = plenty.
+        for _ in range(100):
+            with self._lock:
+                cursor = self._conn.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE parent_session_id = ? "
+                    "  AND started_at >= ("
+                    "      SELECT ended_at FROM sessions "
+                    "      WHERE id = ? AND end_reason = 'compression'"
+                    "  ) "
+                    "ORDER BY started_at DESC LIMIT 1",
+                    (current, current),
+                )
+                row = cursor.fetchone()
+            if row is None:
+                return current
+            current = row["id"]
+        return current
+
+    def list_sessions_rich(
+        self,
+        source: str = None,
+        exclude_sources: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_children: bool = False,
+        min_message_count: int = 0,
+        project_compression_tips: bool = True,
+        order_by_last_active: bool = False,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        id_query: str = None,
+    ) -> List[Dict[str, Any]]:
+        """List sessions with preview (first user message) and last active timestamp.
+
+        Returns dicts with keys: id, source, model, title, started_at, ended_at,
+        message_count, preview (first 60 chars of first user message),
+        last_active (timestamp of last message).
+
+        Uses a single query with correlated subqueries instead of N+2 queries.
+
+        By default, child sessions (subagent runs, compression continuations)
+        are excluded.  Pass ``include_children=True`` to include them.
+
+        With ``project_compression_tips=True`` (default), sessions that are
+        roots of compression chains are projected forward to their latest
+        continuation — one logical conversation = one list entry, showing the
+        live continuation's id/message_count/title/last_active. This prevents
+        compressed continuations from being invisible to users while keeping
+        delegate subagents and branches hidden. Pass ``False`` to return the
+        raw root rows (useful for admin/debug UIs).
+
+        Pass ``order_by_last_active=True`` to sort by most-recent activity
+        instead of original conversation start time. For compression chains,
+        the "most-recent activity" is taken from the live tip (not the root),
+        so an old conversation that was compressed and continued recently
+        surfaces in the correct slot. Ordering is computed at SQL level via
+        a recursive CTE that walks compression-continuation edges, so LIMIT
+        and OFFSET still apply efficiently.
+        """
+        where_clauses = []
+        params = []
+
+        if not include_children:
+            # Show root sessions and branch sessions, while still hiding
+            # sub-agent runs and compression continuations (which also carry a
+            # parent_session_id but were spawned while the parent was still
+            # live — i.e., started_at < parent.ended_at).
+            #
+            # Branch sessions are identified two ways, OR'd for robustness:
+            #   1. A stable ``_branched_from`` marker in model_config, written
+            #      by /branch at creation time. This survives the parent being
+            #      reopened and re-ended with a different end_reason (e.g.
+            #      tui_shutdown overwriting 'branched'), which otherwise hides
+            #      the branch — see issue #20856.
+            #   2. The legacy heuristic (parent ended with 'branched' before the
+            #      child started), covering branch sessions created before the
+            #      marker existed.
+            where_clauses.append(_LISTABLE_CHILD_SQL)
+            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        if exclude_sources:
+            placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({placeholders})")
+            params.extend(exclude_sources)
+        if min_message_count > 0:
+            where_clauses.append("s.message_count >= ?")
+            params.append(min_message_count)
+        if archived_only:
+            where_clauses.append("s.archived = 1")
+        elif not include_archived:
+            where_clauses.append("s.archived = 0")
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        # Optional session-id filter, pushed into SQL so callers (Desktop
+        # session-id search) don't have to fetch every row and filter in
+        # Python. ``id_query`` is matched as a case-insensitive substring
+        # against each surfaced row's id AND every id in its forward
+        # compression chain — so searching a compression *root* id or a *tip*
+        # id both resolve to the same projected conversation. Only used in the
+        # order_by_last_active path (which builds the chain CTE); other callers
+        # pass id_query=None.
+        id_needle = (id_query or "").strip().lower()
+        if order_by_last_active:
+            # Compute effective_last_active by walking each surfaced session's
+            # compression-continuation chain forward in SQL and taking the MAX
+            # timestamp across the chain. This lets us ORDER BY + LIMIT at SQL
+            # level instead of fetching every row and sorting in Python, while
+            # still surfacing old compression roots whose live tip is fresh.
+            #
+            # The CTE seeds from rows the outer WHERE admits (roots + branch
+            # children), then recursively joins forward through
+            # compression-continuation edges using the same criteria as
+            # get_compression_tip (parent.end_reason='compression' AND
+            # child.started_at >= parent.ended_at).
+            outer_where = where_sql
+            id_params: List[Any] = []
+            if id_needle:
+                # Admit a surfaced row if its own id or any id in its forward
+                # compression chain matches the needle. LIKE with a leading
+                # wildcard can't use an index, but the chain membership and
+                # the small result set keep this bounded — far cheaper than
+                # fetching every session and scanning in Python.
+                id_clause = (
+                    "EXISTS (SELECT 1 FROM chain cq"
+                    "        WHERE cq.root_id = s.id"
+                    "          AND LOWER(cq.cur_id) LIKE ? ESCAPE '\\')"
+                )
+                like_pattern = (
+                    "%"
+                    + id_needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    + "%"
+                )
+                id_params = [like_pattern]
+                outer_where = (
+                    f"{where_sql} AND {id_clause}" if where_sql else f"WHERE {id_clause}"
+                )
+            query = f"""
+                WITH RECURSIVE chain(root_id, cur_id) AS (
+                    SELECT s.id, s.id FROM sessions s {where_sql}
+                    UNION ALL
+                    SELECT c.root_id, child.id
+                    FROM chain c
+                    JOIN sessions parent ON parent.id = c.cur_id
+                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                    WHERE parent.end_reason = 'compression'
+                      AND child.started_at >= parent.ended_at
+                ),
+                chain_max AS (
+                    SELECT
+                        root_id,
+                        MAX(COALESCE(
+                            (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = cur_id),
+                            (SELECT started_at FROM sessions ss WHERE ss.id = cur_id)
+                        )) AS effective_last_active
+                    FROM chain
+                    GROUP BY root_id
+                )
+                SELECT s.*,
+                    COALESCE(
+                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                         FROM messages m
+                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(
+                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                        s.started_at
+                    ) AS last_active,
+                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                FROM sessions s
+                LEFT JOIN chain_max cm ON cm.root_id = s.id
+                {outer_where}
+                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                LIMIT ? OFFSET ?
+            """
+            # WHERE params apply twice (CTE seed + outer select); the id filter
+            # only applies to the outer select.
+            params = params + params + id_params + [limit, offset]
+        else:
+            query = f"""
+                SELECT s.*,
+                    COALESCE(
+                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                         FROM messages m
+                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(
+                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                        s.started_at
+                    ) AS last_active
+                FROM sessions s
+                {where_sql}
+                ORDER BY s.started_at DESC
+                LIMIT ? OFFSET ?
+            """
+            params.extend([limit, offset])
+        with self._lock:
+            cursor = self._conn.execute(query, params)
+            rows = cursor.fetchall()
+        sessions = []
+        for row in rows:
+            s = dict(row)
+            # Build the preview from the raw substring
+            raw = s.pop("_preview_raw", "").strip()
+            if raw:
+                text = raw[:60]
+                s["preview"] = text + ("..." if len(raw) > 60 else "")
+            else:
+                s["preview"] = ""
+            # Drop the internal ordering column so callers see a clean dict.
+            s.pop("_effective_last_active", None)
+            sessions.append(s)
+
+        # Project compression roots forward to their tips. Each row whose
+        # end_reason is 'compression' has a continuation child; replace the
+        # surfaced fields (id, message_count, title, last_active, ended_at,
+        # end_reason, preview) with the tip's values so the list entry acts
+        # as the live conversation. Keep the root's started_at to preserve
+        # chronological ordering by original conversation start.
+        if project_compression_tips and not include_children:
+            projected = []
+            for s in sessions:
+                if s.get("end_reason") != "compression":
+                    projected.append(s)
+                    continue
+                tip_id = self.get_compression_tip(s["id"])
+                if tip_id == s["id"]:
+                    projected.append(s)
+                    continue
+                tip_row = self._get_session_rich_row(tip_id)
+                if not tip_row:
+                    projected.append(s)
+                    continue
+                # Preserve the root's started_at for stable sort order, but
+                # surface the tip's identity and activity data.
+                merged = dict(s)
+                for key in (
+                    "id", "ended_at", "end_reason", "message_count",
+                    "tool_call_count", "title", "last_active", "preview",
+                    "model", "system_prompt", "cwd",
+                ):
+                    if key in tip_row:
+                        merged[key] = tip_row[key]
+                merged["_lineage_root_id"] = s["id"]
+                projected.append(merged)
+            sessions = projected
+
+        return sessions
+
+    def list_cron_job_runs(
+        self,
+        job_id: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List the run sessions produced by a single cron job, newest first.
+
+        Cron runs are flat, independent sessions whose id is
+        ``cron_{job_id}_{timestamp}`` (see ``cron/scheduler.run_job``). They are
+        never compression roots and never branch, so this deliberately skips the
+        ``list_sessions_rich`` recursive compression-chain CTE / leading-wildcard
+        ``id_query`` path — that path seeds from *every* ``source='cron'`` row in
+        the DB and only filters to one job's runs after the scan, so it scales
+        with the whole cron pile (a heavy history makes the desktop run-history
+        endpoint time out before it eventually populates).
+
+        Instead this binds to one job with a ``[prefix, prefix_hi)`` range over
+        the id (an index range scan, not a ``%...%`` substring), filters
+        ``source='cron'``, and orders by ``started_at DESC``. Work scales with
+        the requested window, not the total cron history.
+
+        Returns the same enriched row shape as ``list_sessions_rich`` (adds
+        ``preview`` + ``last_active``) so callers can reuse it.
+        """
+        prefix = f"cron_{job_id}_"
+        # Half-open upper bound for an index range scan: increment the final
+        # byte of the prefix so the range covers exactly the ids that start
+        # with ``prefix`` and nothing else. ``prefix`` always ends in '_', but
+        # compute it generically rather than hardcoding the successor char.
+        prefix_hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+        query = """
+            SELECT s.*,
+                COALESCE(
+                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                     FROM messages m
+                     WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                     ORDER BY m.timestamp, m.id LIMIT 1),
+                    ''
+                ) AS _preview_raw,
+                COALESCE(
+                    (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                    s.started_at
+                ) AS last_active
+            FROM sessions s
+            WHERE s.source = 'cron' AND s.id >= ? AND s.id < ?
+            ORDER BY s.started_at DESC, s.id DESC
+            LIMIT ? OFFSET ?
+        """
+        with self._lock:
+            cursor = self._conn.execute(query, (prefix, prefix_hi, limit, offset))
+            rows = cursor.fetchall()
+
+        runs: List[Dict[str, Any]] = []
+        for row in rows:
+            s = dict(row)
+            raw = s.pop("_preview_raw", "").strip()
+            if raw:
+                text = raw[:60]
+                s["preview"] = text + ("..." if len(raw) > 60 else "")
+            else:
+                s["preview"] = ""
+            runs.append(s)
+        return runs
+
+    def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single session with the same enriched columns as
+        ``list_sessions_rich`` (preview + last_active). Returns None if the
+        session doesn't exist.
+        """
+        query = """
+            SELECT s.*,
+                COALESCE(
+                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                     FROM messages m
+                     WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                     ORDER BY m.timestamp, m.id LIMIT 1),
+                    ''
+                ) AS _preview_raw,
+                COALESCE(
+                    (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                    s.started_at
+                ) AS last_active
+            FROM sessions s
+            WHERE s.id = ?
+        """
+        with self._lock:
+            cursor = self._conn.execute(query, (session_id,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        s = dict(row)
+        raw = s.pop("_preview_raw", "").strip()
+        if raw:
+            text = raw[:60]
+            s["preview"] = text + ("..." if len(raw) > 60 else "")
+        else:
+            s["preview"] = ""
+        return s
+
+    # =========================================================================
+    # Message storage
+    # =========================================================================
+
+    # Sentinel prefix used to distinguish JSON-encoded structured content
+    # (multimodal messages: lists of parts like text + image_url) from plain
+    # string content. The NUL byte is not legal in normal text, so this
+    # cannot collide with real user content.
+    _CONTENT_JSON_PREFIX = "\x00json:"
+
+    @classmethod
+    def _encode_content(cls, content: Any) -> Any:
+        """Serialize structured (list/dict) message content for sqlite.
+
+        sqlite3 can only bind ``str``, ``bytes``, ``int``, ``float``, and ``None``
+        to query parameters. Multimodal messages have ``content`` as a list of
+        parts (``[{"type": "text", ...}, {"type": "image_url", ...}]``), which
+        raises ``ProgrammingError: Error binding parameter N: type 'list' is
+        not supported`` when bound directly.
+
+        Returns the value unchanged when it's already a safe scalar, or a
+        sentinel-prefixed JSON string for lists/dicts. Paired with
+        :meth:`_decode_content` on read.
+        """
+        if content is None or isinstance(content, (str, bytes, int, float)):
+            return content
+        try:
+            return cls._CONTENT_JSON_PREFIX + json.dumps(content)
+        except (TypeError, ValueError):
+            # Last-resort fallback: stringify so persistence never fails.
+            return str(content)
+
+    @classmethod
+    def _decode_content(cls, content: Any) -> Any:
+        """Reverse :meth:`_encode_content`; returns scalars unchanged."""
+        if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
+            try:
+                return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Failed to decode JSON-encoded message content; "
+                    "returning raw string"
+                )
+                return content
+        return content
+
+    def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str = None,
+        tool_name: str = None,
+        tool_calls: Any = None,
+        tool_call_id: str = None,
+        token_count: int = None,
+        finish_reason: str = None,
+        reasoning: str = None,
+        reasoning_content: str = None,
+        reasoning_details: Any = None,
+        codex_reasoning_items: Any = None,
+        codex_message_items: Any = None,
+        platform_message_id: str = None,
+        observed: bool = False,
+        timestamp: Any = None,
+    ) -> int:
+        """
+        Append a message to a session. Returns the message row ID.
+
+        Also increments the session's message_count (and tool_call_count
+        if role is 'tool' or tool_calls is present).
+
+        ``platform_message_id`` is the external messaging platform's own
+        message ID (e.g. Telegram update_id, Yuanbao msg_id).  It is
+        independent of the SQLite autoincrement primary key and is used by
+        platform-specific flows like yuanbao's recall guard to redact a
+        message by its platform-side identifier.
+        """
+        # Serialize structured fields to JSON before entering the write txn
+        reasoning_details_json = (
+            json.dumps(reasoning_details)
+            if reasoning_details else None
+        )
+        codex_items_json = (
+            json.dumps(codex_reasoning_items)
+            if codex_reasoning_items else None
+        )
+        codex_message_items_json = (
+            json.dumps(codex_message_items)
+            if codex_message_items else None
+        )
+        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        # Multimodal content (list of parts) must be JSON-encoded: sqlite3
+        # cannot bind list/dict parameters directly.
+        stored_content = self._encode_content(content)
+
+        message_timestamp = time.time()
+        if timestamp is not None:
+            try:
+                if hasattr(timestamp, "timestamp"):
+                    message_timestamp = float(timestamp.timestamp())
+                else:
+                    message_timestamp = float(timestamp)
+            except (TypeError, ValueError):
+                logger.debug("Ignoring invalid explicit message timestamp: %r", timestamp)
+
+        # Pre-compute tool call count
+        num_tool_calls = 0
+        if tool_calls is not None:
+            num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                   tool_calls, tool_name, timestamp, token_count, finish_reason,
+                   reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+                   codex_message_items, platform_message_id, observed)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    role,
+                    stored_content,
+                    tool_call_id,
+                    tool_calls_json,
+                    tool_name,
+                    message_timestamp,
+                    token_count,
+                    finish_reason,
+                    reasoning,
+                    reasoning_content,
+                    reasoning_details_json,
+                    codex_items_json,
+                    codex_message_items_json,
+                    platform_message_id,
+                    1 if observed else 0,
+                ),
+            )
+            msg_id = cursor.lastrowid
+
+            # Update counters
+            if num_tool_calls > 0:
+                conn.execute(
+                    """UPDATE sessions SET message_count = message_count + 1,
+                       tool_call_count = tool_call_count + ? WHERE id = ?""",
+                    (num_tool_calls, session_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                    (session_id,),
+                )
+            return msg_id
+
+        return self._execute_write(_do)
+
+    def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Atomically replace every message for a session.
+
+        Used by transcript-rewrite flows such as /retry, /undo, and /compress.
+        The delete + reinsert sequence must commit as one transaction so a
+        mid-rewrite failure does not leave SQLite with a partial transcript.
+        """
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?", (session_id,)
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                (session_id,),
+            )
+
+            now_ts = time.time()
+            total_messages = 0
+            total_tool_calls = 0
+            for msg in messages:
+                role = msg.get("role", "unknown")
+                tool_calls = msg.get("tool_calls")
+                message_timestamp = now_ts
+                if msg.get("timestamp") is not None:
+                    try:
+                        ts_value = msg.get("timestamp")
+                        if hasattr(ts_value, "timestamp"):
+                            message_timestamp = float(ts_value.timestamp())
+                        else:
+                            message_timestamp = float(ts_value)
+                    except (TypeError, ValueError):
+                        logger.debug("Ignoring invalid explicit message timestamp: %r", msg.get("timestamp"))
+                reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
+                codex_reasoning_items = (
+                    msg.get("codex_reasoning_items") if role == "assistant" else None
+                )
+                codex_message_items = (
+                    msg.get("codex_message_items") if role == "assistant" else None
+                )
+
+                reasoning_details_json = (
+                    json.dumps(reasoning_details) if reasoning_details else None
+                )
+                codex_items_json = (
+                    json.dumps(codex_reasoning_items) if codex_reasoning_items else None
+                )
+                codex_message_items_json = (
+                    json.dumps(codex_message_items) if codex_message_items else None
+                )
+                tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+                # Accept either `platform_message_id` (new explicit name) or
+                # `message_id` (yuanbao's existing convention on message dicts).
+                platform_msg_id = (
+                    msg.get("platform_message_id") or msg.get("message_id")
+                )
+
+                conn.execute(
+                    """INSERT INTO messages (session_id, role, content, tool_call_id,
+                       tool_calls, tool_name, timestamp, token_count, finish_reason,
+                       reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
+                       codex_message_items, platform_message_id, observed)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        role,
+                        self._encode_content(msg.get("content")),
+                        msg.get("tool_call_id"),
+                        tool_calls_json,
+                        msg.get("tool_name"),
+                        message_timestamp,
+                        msg.get("token_count"),
+                        msg.get("finish_reason"),
+                        msg.get("reasoning") if role == "assistant" else None,
+                        msg.get("reasoning_content") if role == "assistant" else None,
+                        reasoning_details_json,
+                        codex_items_json,
+                        codex_message_items_json,
+                        platform_msg_id,
+                        1 if msg.get("observed") else 0,
+                    ),
+                )
+                total_messages += 1
+                if tool_calls is not None:
+                    total_tool_calls += (
+                        len(tool_calls) if isinstance(tool_calls, list) else 1
+                    )
+                now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
+
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (total_messages, total_tool_calls, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def get_messages(
+        self, session_id: str, include_inactive: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Load messages for a session in insertion order.
+
+        By default only active messages are returned. Pass
+        ``include_inactive=True`` to load soft-deleted rows (e.g. for
+        audit / debug views of rewound history). See
+        :meth:`rewind_to_message` for the soft-delete mechanic.
+
+        Ordered by AUTOINCREMENT id (true insertion order) rather than
+        timestamp — see c03acca50 for the WSL2 clock-regression rationale.
+        """
+        active_clause = "" if include_inactive else " AND active = 1"
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM messages WHERE session_id = ?"
+                f"{active_clause} ORDER BY id",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
+                    msg["tool_calls"] = []
+            result.append(msg)
+        return result
+
+    def get_messages_around(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+    ) -> Dict[str, Any]:
+        """Load a window of messages anchored on a specific message id.
+
+        Returns a dict with:
+          - ``window``: up to ``window`` messages before the anchor, the anchor
+            itself, and up to ``window`` messages after, ordered by id ascending.
+          - ``messages_before``: count of messages strictly before the anchor
+            still in the session (== window unless we hit the start).
+          - ``messages_after``: count of messages strictly after the anchor
+            still in the session (== window unless we hit the end).
+
+        Used by ``session_search`` for both the discovery shape (anchored on the
+        FTS5 match) and the scroll shape (anchored on any message id). The
+        ``messages_before`` / ``messages_after`` counts let the caller detect
+        session boundaries: when either is less than ``window``, the agent has
+        reached one end of the session.
+
+        Returns an empty window when ``around_message_id`` is not a real id in
+        ``session_id`` — callers decide how to surface that.
+        """
+        if window < 0:
+            window = 0
+        with self._lock:
+            # Confirm the anchor exists in this session.
+            anchor_exists = self._conn.execute(
+                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                (around_message_id, session_id),
+            ).fetchone()
+            if not anchor_exists:
+                return {"window": [], "messages_before": 0, "messages_after": 0}
+
+            # Two queries: anchor + before (DESC, take window+1), and after
+            # (ASC, take window). Final order is id ASC.
+            before_rows = self._conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND id <= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, around_message_id, window + 1),
+            ).fetchall()
+            after_rows = self._conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (session_id, around_message_id, window),
+            ).fetchall()
+
+        # before_rows is DESC; reverse so it's ASC, then concatenate after_rows.
+        rows = list(reversed(before_rows)) + list(after_rows)
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_messages_around, falling back to []"
+                    )
+                    msg["tool_calls"] = []
+            result.append(msg)
+
+        # before_rows includes the anchor itself; subtract 1 for the count of
+        # messages strictly before the anchor in the returned slice.
+        messages_before = max(0, len(before_rows) - 1)
+        messages_after = len(after_rows)
+        return {
+            "window": result,
+            "messages_before": messages_before,
+            "messages_after": messages_after,
+        }
+
+    def get_anchored_view(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+        bookend: int = 3,
+        keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+    ) -> Dict[str, Any]:
+        """Return an anchored window plus session bookends.
+
+        Built on top of ``get_messages_around``. Three slices:
+
+          - ``window``: messages immediately surrounding the anchor. Filtered
+            to ``keep_roles`` (tool-response noise dropped by default), EXCEPT
+            the anchor itself is always preserved regardless of role.
+          - ``bookend_start``: first ``bookend`` user/assistant messages of the
+            session — but only those whose id is strictly before the window's
+            first message id. Empty when the window already overlaps the
+            session head. Empty-content messages (tool-call-only assistant
+            turns) are skipped so they don't crowd out actual prose openings.
+          - ``bookend_end``: last ``bookend`` user/assistant messages of the
+            session, same non-overlap rule at the tail.
+
+        Bookends let an FTS5 hit anywhere in a long session yield the goal
+        (opening) and the resolution (closing) on a single call — without
+        loading the whole transcript.
+
+        Returns ``{"window": [], "messages_before": 0, "messages_after": 0,
+        "bookend_start": [], "bookend_end": []}`` when the anchor isn't in
+        the session.
+
+        ``keep_roles=None`` disables role filtering (raw window + raw
+        bookends).
+        """
+        if bookend < 0:
+            bookend = 0
+
+        # Reuse the primitive — handles anchor-existence, content decoding,
+        # tool_calls deserialisation, and boundary counts.
+        primitive = self.get_messages_around(
+            session_id, around_message_id, window=window
+        )
+        window_rows = primitive["window"]
+        if not window_rows:
+            return {
+                "window": [],
+                "messages_before": 0,
+                "messages_after": 0,
+                "bookend_start": [],
+                "bookend_end": [],
+            }
+
+        # Apply role filter to the window, but never drop the anchor itself.
+        if keep_roles is not None:
+            keep_set = set(keep_roles)
+            filtered_window = [
+                m for m in window_rows
+                if m.get("id") == around_message_id or m.get("role") in keep_set
+            ]
+        else:
+            filtered_window = window_rows
+
+        window_min_id = window_rows[0]["id"]
+        window_max_id = window_rows[-1]["id"]
+
+        # Fetch bookends only when there's room outside the window. SQL filters
+        # by id range, role, and non-empty content — tool-call-only assistant
+        # turns (content='' with tool_calls populated) are excluded so they
+        # don't crowd out actual prose openings/closings.
+        bookend_start_rows: List[Any] = []
+        bookend_end_rows: List[Any] = []
+        if bookend > 0:
+            with self._lock:
+                role_clause = ""
+                role_params: list = []
+                if keep_roles is not None:
+                    role_placeholders = ",".join("?" for _ in keep_roles)
+                    role_clause = f" AND role IN ({role_placeholders})"
+                    role_params = list(keep_roles)
+
+                bookend_start_rows = self._conn.execute(
+                    f"SELECT * FROM messages "
+                    f"WHERE session_id = ? AND id < ?{role_clause} "
+                    f"AND length(content) > 0 "
+                    f"ORDER BY id ASC LIMIT ?",
+                    (session_id, window_min_id, *role_params, bookend),
+                ).fetchall()
+
+                bookend_end_rows = self._conn.execute(
+                    f"SELECT * FROM messages "
+                    f"WHERE session_id = ? AND id > ?{role_clause} "
+                    f"AND length(content) > 0 "
+                    f"ORDER BY id DESC LIMIT ?",
+                    (session_id, window_max_id, *role_params, bookend),
+                ).fetchall()
+                # End rows came back DESC for the LIMIT cap; flip to ASC.
+                bookend_end_rows = list(reversed(bookend_end_rows))
+
+        def _hydrate(row) -> Dict[str, Any]:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_anchored_view, falling back to []"
+                    )
+                    msg["tool_calls"] = []
+            return msg
+
+        return {
+            "window": filtered_window,
+            "messages_before": primitive["messages_before"],
+            "messages_after": primitive["messages_after"],
+            "bookend_start": [_hydrate(r) for r in bookend_start_rows],
+            "bookend_end": [_hydrate(r) for r in bookend_end_rows],
+        }
+
+    def resolve_resume_session_id(self, session_id: str) -> str:
+        """Redirect a resume target to the descendant session that holds the messages.
+
+        Context compression ends the current session and forks a new child session
+        (linked via ``parent_session_id``). The flush cursor is reset, so the
+        child is where new messages actually land — the parent ends up with
+        ``message_count = 0`` rows unless messages had already been flushed to
+        it before compression. See #15000.
+
+        This helper walks ``parent_session_id`` forward from ``session_id`` and
+        returns the first descendant in the chain that has at least one message
+        row. If the original session already has messages, or no descendant
+        has any, the original ``session_id`` is returned unchanged.
+
+        The chain is always walked via the child whose ``started_at`` is
+        latest; that matches the single-chain shape that compression creates.
+        A depth cap (32) guards against accidental loops in malformed data.
+        """
+        if not session_id:
+            return session_id
+
+        with self._lock:
+            # If this session already has messages, nothing to redirect.
+            try:
+                row = self._conn.execute(
+                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            except Exception:
+                return session_id
+            if row is not None:
+                return session_id
+
+            # Walk descendants: at each step, pick the most-recently-started
+                # child session; stop once we find one with messages.
+            current = session_id
+            seen = {current}
+            for _ in range(32):
+                try:
+                    child_row = self._conn.execute(
+                        "SELECT id FROM sessions "
+                        "WHERE parent_session_id = ? "
+                        "ORDER BY started_at DESC, id DESC LIMIT 1",
+                        (current,),
+                    ).fetchone()
+                except Exception:
+                    return session_id
+                if child_row is None:
+                    return session_id
+                child_id = child_row["id"] if hasattr(child_row, "keys") else child_row[0]
+                if not child_id or child_id in seen:
+                    return session_id
+                seen.add(child_id)
+                try:
+                    msg_row = self._conn.execute(
+                        "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                        (child_id,),
+                    ).fetchone()
+                except Exception:
+                    return session_id
+                if msg_row is not None:
+                    return child_id
+                current = child_id
+        return session_id
+
+    def get_messages_as_conversation(
+        self,
+        session_id: str,
+        include_ancestors: bool = False,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Load messages in the OpenAI conversation format (role + content dicts).
+        Used by the gateway to restore conversation history.
+
+        By default only active messages are returned. Pass
+        ``include_inactive=True`` to load soft-deleted (rewound) rows
+        as well. See :meth:`rewind_to_message`.
+        """
+        session_ids = [session_id]
+        if include_ancestors:
+            session_ids = self._session_lineage_root_to_tip(session_id)
+
+        active_clause = "" if include_inactive else " AND active = 1"
+        with self._lock:
+            placeholders = ",".join("?" for _ in session_ids)
+            rows = self._conn.execute(
+                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
+                "finish_reason, reasoning, reasoning_content, reasoning_details, "
+                "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
+                f"FROM messages WHERE session_id IN ({placeholders})"
+                # ORDER BY id (global autoincrement = true insertion order), NOT
+                # timestamp: a backward wall-clock step (e.g. WSL2 clock
+                # regression) between two appends would otherwise swap their
+                # replay order. This matches get_messages() — see its docstring
+                # citing commit c03acca50.
+                f"{active_clause} ORDER BY id",
+                tuple(session_ids),
+            ).fetchall()
+
+        messages = []
+        for row in rows:
+            content = self._decode_content(row["content"])
+            if row["role"] in {"user", "assistant"} and isinstance(content, str):
+                content = sanitize_context(content).strip()
+            msg = {"role": row["role"], "content": content}
+            if row["timestamp"]:
+                msg["timestamp"] = row["timestamp"]
+            if row["tool_call_id"]:
+                msg["tool_call_id"] = row["tool_call_id"]
+            if row["tool_name"]:
+                msg["tool_name"] = row["tool_name"]
+            if row["tool_calls"]:
+                try:
+                    msg["tool_calls"] = json.loads(row["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
+                    msg["tool_calls"] = []
+            # Surface the platform-side message id (e.g. yuanbao msg_id,
+            # telegram update_id) so platform-specific flows like recall
+            # can match by external identifier instead of having to fall
+            # back to content-match heuristics.  Exposed as ``message_id``
+            # for backward compatibility with the JSONL transcript shape.
+            if row["platform_message_id"]:
+                msg["message_id"] = row["platform_message_id"]
+            if row["observed"]:
+                msg["observed"] = True
+            # Restore reasoning fields on assistant messages so providers
+            # that replay reasoning (OpenRouter, OpenAI, Nous) receive
+            # coherent multi-turn reasoning context.
+            if row["role"] == "assistant":
+                if row["finish_reason"]:
+                    msg["finish_reason"] = row["finish_reason"]
+                if row["reasoning"]:
+                    msg["reasoning"] = row["reasoning"]
+                if row["reasoning_content"] is not None:
+                    msg["reasoning_content"] = row["reasoning_content"]
+                if row["reasoning_details"]:
+                    try:
+                        msg["reasoning_details"] = json.loads(row["reasoning_details"])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning("Failed to deserialize reasoning_details, falling back to None")
+                        msg["reasoning_details"] = None
+                if row["codex_reasoning_items"]:
+                    try:
+                        msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
+                        msg["codex_reasoning_items"] = None
+                if row["codex_message_items"]:
+                    try:
+                        msg["codex_message_items"] = json.loads(row["codex_message_items"])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning("Failed to deserialize codex_message_items, falling back to None")
+                        msg["codex_message_items"] = None
+            if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
+                continue
+            messages.append(msg)
+        return messages
+
+    def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
+        if not session_id:
+            return [session_id]
+
+        chain = []
+        current = session_id
+        seen = set()
+        with self._lock:
+            for _ in range(100):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                chain.append(current)
+                row = self._conn.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    break
+                current = row["parent_session_id"] if hasattr(row, "keys") else row[0]
+        return list(reversed(chain)) or [session_id]
+
+    @staticmethod
+    def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:
+        if msg.get("role") != "user":
+            return False
+        content = msg.get("content")
+        if not isinstance(content, str) or not content:
+            return False
+        for prev in reversed(messages):
+            if prev.get("role") == "user" and prev.get("content") == content:
+                return True
+            if prev.get("role") == "assistant" and (prev.get("content") or prev.get("tool_calls")):
+                return False
+        return False
+
+    # =========================================================================
+    # Rewind (soft-delete) — see /rewind slash command + issue #21910
+    # =========================================================================
+
+    def rewind_to_message(
+        self, session_id: str, target_message_id: int
+    ) -> Dict[str, Any]:
+        """Soft-delete all messages with id >= ``target_message_id`` in *session_id*.
+
+        The target message itself becomes inactive as well so the caller
+        can pre-fill it as the next user prompt without it appearing
+        twice in the replayed transcript.  Rewound rows are kept on
+        disk with ``active=0`` for audit / forensic inspection — use
+        :meth:`get_messages` with ``include_inactive=True`` to see them.
+
+        Returns a dict::
+
+            {
+                "rewound_count": int,    # number of rows newly flipped to active=0
+                "target_message": dict,  # full row dict of the target
+                "new_head_id":   int|None  # id of the last still-active row, or None
+            }
+
+        Raises ``ValueError`` if the target message does not exist in
+        *session_id* or if its role is not ``"user"``.
+
+        Always increments ``sessions.rewind_count`` — even when the
+        target is already inactive — so the counter accurately reflects
+        the number of rewind operations performed against the session.
+        Idempotent on the ``active`` flag: re-rewinding past the same
+        target is a no-op on row state but still bumps the counter.
+        """
+
+        # 1) Validate target up-front (read-only, outside the write txn).
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM messages WHERE id = ? AND session_id = ?",
+                (target_message_id, session_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(
+                f"message {target_message_id} not found in session {session_id}"
+            )
+        target_row = dict(row)
+        if target_row.get("role") != "user":
+            raise ValueError(
+                f"rewind target must be a 'user' message (got role="
+                f"{target_row.get('role')!r}, id={target_message_id})"
+            )
+
+        # Decode content for callers (prefill the prompt buffer).
+        target_row["content"] = self._decode_content(target_row.get("content"))
+
+        rewound: List[int] = []
+
+        def _do(conn):
+            cursor = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND id >= ? AND active = 1",
+                (session_id, target_message_id),
+            )
+            ids = [r[0] for r in cursor.fetchall()]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"UPDATE messages SET active = 0 WHERE id IN ({placeholders})",
+                    ids,
+                )
+            conn.execute(
+                "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
+                "WHERE id = ?",
+                (session_id,),
+            )
+            return ids
+
+        rewound = self._execute_write(_do)
+
+        # 2) Compute new head id (largest still-active row id in session).
+        with self._lock:
+            head_row = self._conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+        new_head_id = head_row[0] if head_row and head_row[0] is not None else None
+
+        return {
+            "rewound_count": len(rewound),
+            "target_message": target_row,
+            "new_head_id": new_head_id,
+        }
+
+    def restore_rewound(self, session_id: str, since_message_id: int) -> int:
+        """Mark inactive messages with id >= *since_message_id* active again.
+
+        Returns the number of rows flipped back to ``active=1``.
+        Intended for undo-of-rewind and test cleanup; not wired to a
+        slash command in v1.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND id >= ? AND active = 0",
+                (session_id, since_message_id),
+            )
+            ids = [r[0] for r in cursor.fetchall()]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                conn.execute(
+                    f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
+                    ids,
+                )
+            return len(ids)
+
+        return self._execute_write(_do)
+
+    def list_recent_user_messages(
+        self,
+        session_id: str,
+        limit: int = 20,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return the *limit* most-recent user messages, newest first.
+
+        Each entry is a dict with keys ``id``, ``timestamp``, ``preview``.
+        ``preview`` is the first 80 characters of the message content
+        (with line breaks collapsed to spaces). Used by the /rewind
+        slash command picker.
+
+        By default only active messages are returned.
+        """
+        active_clause = "" if include_inactive else " AND active = 1"
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT id, timestamp, content FROM messages "
+                "WHERE session_id = ? AND role = 'user'"
+                f"{active_clause} "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, int(limit)),
+            )
+            rows = cursor.fetchall()
+
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            decoded = self._decode_content(row["content"])
+            if isinstance(decoded, list):
+                # Multimodal — flatten text parts.
+                text_parts = [
+                    p.get("text", "") for p in decoded
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                preview = " ".join(t for t in text_parts if t).strip()
+                if not preview:
+                    preview = "[multimodal content]"
+            elif isinstance(decoded, str):
+                preview = decoded
+            else:
+                preview = ""
+            preview = " ".join(preview.split())  # collapse whitespace
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
+            result.append(
+                {
+                    "id": row["id"],
+                    "timestamp": row["timestamp"],
+                    "preview": preview,
+                }
+            )
+        return result
+
+    # =========================================================================
+    # Search
+    # =========================================================================
+
+    @staticmethod
+    def _sanitize_fts5_query(query: str) -> str:
+        """Sanitize user input for safe use in FTS5 MATCH queries.
+
+        FTS5 has its own query syntax where characters like ``"``, ``(``, ``)``,
+        ``+``, ``*``, ``{``, ``}``, the column-filter operator ``:`` and bare
+        boolean operators (``AND``, ``OR``, ``NOT``) have special meaning.
+        Passing raw user input directly to MATCH can cause
+        ``sqlite3.OperationalError``.
+
+        Strategy:
+        - Preserve properly paired quoted phrases (``"exact phrase"``)
+        - Strip unmatched FTS5-special characters that would cause errors
+        - Wrap unquoted hyphenated and dotted terms in quotes so FTS5
+          matches them as exact phrases instead of splitting on the
+          hyphen/dot (e.g. ``chat-send``, ``P2.2``, ``my-app.config.ts``)
+        """
+        # Step 1: Extract balanced double-quoted phrases and protect them
+        # from further processing via numbered placeholders.
+        _quoted_parts: list = []
+
+        def _preserve_quoted(m: re.Match) -> str:
+            _quoted_parts.append(m.group(0))
+            return f"\x00Q{len(_quoted_parts) - 1}\x00"
+
+        sanitized = re.sub(r'"[^"]*"', _preserve_quoted, query)
+
+        # Step 2: Strip remaining (unmatched) FTS5-special characters.  ``:`` is
+        # FTS5's column-filter operator (``col:term``); since the FTS table has a
+        # single ``content`` column, an unquoted colon query like ``TODO: fix``
+        # parses as ``column:term`` and raises "no such column" — swallowed at
+        # the execute site into zero results.  Strip it like the others.
+        sanitized = re.sub(r'[+{}():\"^]', " ", sanitized)
+
+        # Step 3: Collapse repeated * (e.g. "***") into a single one,
+        # and remove leading * (prefix-only needs at least one char before *)
+        sanitized = re.sub(r"\*+", "*", sanitized)
+        sanitized = re.sub(r"(^|\s)\*", r"\1", sanitized)
+
+        # Step 4: Remove dangling boolean operators at start/end that would
+        # cause syntax errors (e.g. "hello AND" or "OR world")
+        sanitized = re.sub(r"(?i)^(AND|OR|NOT)\b\s*", "", sanitized.strip())
+        sanitized = re.sub(r"(?i)\s+(AND|OR|NOT)\s*$", "", sanitized.strip())
+
+        # Step 5: Wrap unquoted dotted and/or hyphenated terms in double
+        # quotes.  FTS5's tokenizer splits on dots and hyphens, turning
+        # ``chat-send`` into ``chat AND send`` and ``P2.2`` into ``p2 AND 2``.
+        # Quoting preserves phrase semantics.  A single pass avoids the
+        # double-quoting bug that would occur if dotted, hyphenated and underscored
+        # patterns were applied sequentially (e.g. ``my-app.config``).
+        sanitized = re.sub(r"\b(\w+(?:[._-]\w+)+)\b", r'"\1"', sanitized)
+
+        # Step 6: Restore preserved quoted phrases
+        for i, quoted in enumerate(_quoted_parts):
+            sanitized = sanitized.replace(f"\x00Q{i}\x00", quoted)
+
+        return sanitized.strip()
+
+
+    @staticmethod
+    def _is_cjk_codepoint(cp: int) -> bool:
+        return (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
+                0x3400 <= cp <= 0x4DBF or    # CJK Extension A
+                0x20000 <= cp <= 0x2A6DF or  # CJK Extension B
+                0x3000 <= cp <= 0x303F or    # CJK Symbols
+                0x3040 <= cp <= 0x309F or    # Hiragana
+                0x30A0 <= cp <= 0x30FF or    # Katakana
+                0xAC00 <= cp <= 0xD7AF)      # Hangul Syllables
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        """Check if text contains CJK (Chinese, Japanese, Korean) characters."""
+        for ch in text:
+            cp = ord(ch)
+            if (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
+                0x3400 <= cp <= 0x4DBF or    # CJK Extension A
+                0x20000 <= cp <= 0x2A6DF or  # CJK Extension B
+                0x3000 <= cp <= 0x303F or    # CJK Symbols
+                0x3040 <= cp <= 0x309F or    # Hiragana
+                0x30A0 <= cp <= 0x30FF or    # Katakana
+                0xAC00 <= cp <= 0xD7AF):     # Hangul Syllables
+                return True
+        return False
+
+    @classmethod
+    def _count_cjk(cls, text: str) -> int:
+        """Count CJK characters in text."""
+        return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
+
+    def search_messages(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        sort: str = None,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Full-text search across session messages using FTS5.
+
+        Supports FTS5 query syntax:
+          - Simple keywords: "docker deployment"
+          - Phrases: '"exact phrase"'
+          - Boolean: "docker OR kubernetes", "python NOT java"
+          - Prefix: "deploy*"
+
+        Returns matching messages with session metadata, content snippet,
+        and surrounding context (1 message before and after the match).
+
+        ``sort`` controls temporal ordering:
+          - ``None`` (default): FTS5 BM25 relevance only. Time-neutral.
+          - ``"newest"``: order by message timestamp DESC, then by rank.
+          - ``"oldest"``: order by message timestamp ASC, then by rank.
+
+        The short-CJK LIKE fallback already orders by timestamp DESC and
+        ignores ``sort``. The trigram CJK path honours ``sort`` like the main
+        FTS5 path.
+
+        Rewound (``active=0``) rows are excluded by default. Pass
+        ``include_inactive=True`` to search every row.
+        """
+        if not self._fts_enabled:
+            return []
+
+        if not query or not query.strip():
+            return []
+
+        query = self._sanitize_fts5_query(query)
+        if not query:
+            return []
+
+        # Normalise sort. Anything not in the allowed set falls back to None
+        # (FTS5 rank-only) so callers can pass through user input without
+        # validation.
+        if isinstance(sort, str):
+            sort_norm = sort.strip().lower()
+            if sort_norm not in ("newest", "oldest"):
+                sort_norm = None
+        else:
+            sort_norm = None
+
+        # ORDER BY shared across the main FTS5 path and trigram CJK path.
+        # With sort set, timestamp is primary and rank is the tiebreaker.
+        if sort_norm == "newest":
+            order_by_sql = "ORDER BY m.timestamp DESC, rank"
+        elif sort_norm == "oldest":
+            order_by_sql = "ORDER BY m.timestamp ASC, rank"
+        else:
+            order_by_sql = "ORDER BY rank"
+
+        # Build WHERE clauses dynamically
+        where_clauses = ["messages_fts MATCH ?"]
+        params: list = [query]
+        if not include_inactive:
+            where_clauses.append("m.active = 1")
+
+        if source_filter is not None:
+            source_placeholders = ",".join("?" for _ in source_filter)
+            where_clauses.append(f"s.source IN ({source_placeholders})")
+            params.extend(source_filter)
+
+        if exclude_sources is not None:
+            exclude_placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
+            params.extend(exclude_sources)
+
+        if role_filter:
+            role_placeholders = ",".join("?" for _ in role_filter)
+            where_clauses.append(f"m.role IN ({role_placeholders})")
+            params.extend(role_filter)
+
+        where_sql = " AND ".join(where_clauses)
+        params.extend([limit, offset])
+
+        sql = f"""
+            SELECT
+                m.id,
+                m.session_id,
+                m.role,
+                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
+                m.content,
+                m.timestamp,
+                m.tool_name,
+                s.source,
+                s.model,
+                s.started_at AS session_started
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {where_sql}
+            {order_by_sql}
+            LIMIT ? OFFSET ?
+        """
+
+        # CJK queries bypass the unicode61 FTS5 table.  The default tokenizer
+        # splits CJK characters into individual tokens, so "大别山项目" becomes
+        # "大 AND 别 AND 山 AND 项 AND 目" — producing false positives and
+        # missing exact phrase matches.
+        #
+        # For queries with 3+ CJK characters, we use the trigram FTS5 table
+        # (indexed substring matching with ranking and snippets).  For shorter
+        # CJK queries (1-2 chars), trigram can't match (it needs ≥9 UTF-8
+        # bytes = 3 CJK chars), so we fall back to LIKE.
+        is_cjk = self._contains_cjk(query)
+        if is_cjk:
+            raw_query = query.strip('"').strip()
+            cjk_count = self._count_cjk(raw_query)
+
+            # Per-token CJK length check (#20494): trigram needs >=3 CJK chars
+            # per token. A query like "广西 OR 桂林 OR 漓江" has cjk_count=6
+            # (>=3) but each individual token is only 2 chars — trigram returns 0.
+            # Route to LIKE when any non-operator CJK token is <3 CJK chars.
+            _tokens_for_check = [
+                t for t in raw_query.split()
+                if t.upper() not in {"AND", "OR", "NOT"} and self._contains_cjk(t)
+            ]
+            _any_short_cjk = any(
+                self._count_cjk(t) < 3 for t in _tokens_for_check
+            )
+
+            if cjk_count >= 3 and not _any_short_cjk:
+                # Trigram FTS5 path — quote each non-operator token to handle
+                # FTS5 special chars (%, *, etc.) while preserving boolean
+                # operators (AND, OR, NOT) for multi-term queries.
+                tokens = raw_query.split()
+                parts = []
+                for tok in tokens:
+                    if tok.upper() in {"AND", "OR", "NOT"}:
+                        parts.append(tok)
+                    else:
+                        parts.append('"' + tok.replace('"', '""') + '"')
+                trigram_query = " ".join(parts)
+                tri_where = ["messages_fts_trigram MATCH ?"]
+                tri_params: list = [trigram_query]
+                if not include_inactive:
+                    tri_where.append("m.active = 1")
+                if source_filter is not None:
+                    tri_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                    tri_params.extend(source_filter)
+                if exclude_sources is not None:
+                    tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                    tri_params.extend(exclude_sources)
+                if role_filter:
+                    tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                    tri_params.extend(role_filter)
+                tri_sql = f"""
+                    SELECT
+                        m.id,
+                        m.session_id,
+                        m.role,
+                        snippet(messages_fts_trigram, 0, '>>>', '<<<', '...', 40) AS snippet,
+                        m.content,
+                        m.timestamp,
+                        m.tool_name,
+                        s.source,
+                        s.model,
+                        s.started_at AS session_started
+                    FROM messages_fts_trigram
+                    JOIN messages m ON m.id = messages_fts_trigram.rowid
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE {' AND '.join(tri_where)}
+                    {order_by_sql}
+                    LIMIT ? OFFSET ?
+                """
+                tri_params.extend([limit, offset])
+                with self._lock:
+                    try:
+                        tri_cursor = self._conn.execute(tri_sql, tri_params)
+                    except sqlite3.OperationalError:
+                        matches = []
+                    else:
+                        matches = [dict(row) for row in tri_cursor.fetchall()]
+            else:
+                # Short / mixed CJK query: trigram cannot match tokens with
+                # <3 CJK chars. Fall back to LIKE substring search.
+                # For multi-token OR queries (e.g. "广西 OR 桂林 OR 漓江"),
+                # build one LIKE condition per non-operator token so each term
+                # is matched independently (#20494).
+                non_op_tokens = [
+                    t for t in raw_query.split()
+                    if t.upper() not in {"AND", "OR", "NOT"}
+                ] or [raw_query]
+                token_clauses = []
+                like_params: list = []
+                for tok in non_op_tokens:
+                    esc = tok.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    token_clauses.append(
+                        "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
+                    )
+                    like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
+                like_where = [f"({' OR '.join(token_clauses)})"]
+                if source_filter is not None:
+                    like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                    like_params.extend(source_filter)
+                if exclude_sources is not None:
+                    like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                    like_params.extend(exclude_sources)
+                if role_filter:
+                    like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                    like_params.extend(role_filter)
+                like_sql = f"""
+                    SELECT m.id, m.session_id, m.role,
+                           substr(m.content,
+                                  max(1, instr(m.content, ?) - 40),
+                                  120) AS snippet,
+                           m.content, m.timestamp, m.tool_name,
+                           s.source, s.model, s.started_at AS session_started
+                    FROM messages m
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE {' AND '.join(like_where)}
+                    ORDER BY m.timestamp DESC
+                    LIMIT ? OFFSET ?
+                """
+                like_params.extend([limit, offset])
+                # instr() for snippet uses first search token
+                like_params = [non_op_tokens[0]] + like_params
+                with self._lock:
+                    like_cursor = self._conn.execute(like_sql, like_params)
+                    matches = [dict(row) for row in like_cursor.fetchall()]
+        else:
+            with self._lock:
+                try:
+                    cursor = self._conn.execute(sql, params)
+                except sqlite3.OperationalError:
+                    # FTS5 query syntax error despite sanitization — return empty
+                    return []
+                else:
+                    matches = [dict(row) for row in cursor.fetchall()]
+
+        # Add surrounding context (1 message before + after each match).
+        # Done outside the lock so we don't hold it across N sequential queries.
+        for match in matches:
+            try:
+                with self._lock:
+                    ctx_cursor = self._conn.execute(
+                        """WITH target AS (
+                               SELECT session_id, timestamp, id
+                               FROM messages
+                               WHERE id = ?
+                           )
+                           SELECT role, content
+                           FROM (
+                               SELECT m.id, m.timestamp, m.role, m.content
+                               FROM messages m
+                               JOIN target t ON t.session_id = m.session_id
+                               WHERE (m.timestamp < t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
+                               ORDER BY m.timestamp DESC, m.id DESC
+                               LIMIT 1
+                           )
+                           UNION ALL
+                           SELECT role, content
+                           FROM messages
+                           WHERE id = ?
+                           UNION ALL
+                           SELECT role, content
+                           FROM (
+                               SELECT m.id, m.timestamp, m.role, m.content
+                               FROM messages m
+                               JOIN target t ON t.session_id = m.session_id
+                               WHERE (m.timestamp > t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
+                               ORDER BY m.timestamp ASC, m.id ASC
+                               LIMIT 1
+                           )""",
+                        (match["id"], match["id"]),
+                    )
+                    context_msgs = []
+                    for r in ctx_cursor.fetchall():
+                        raw = r["content"]
+                        decoded = self._decode_content(raw)
+                        # Multimodal context: render a compact text-only
+                        # summary for search previews.
+                        if isinstance(decoded, list):
+                            text_parts = [
+                                p.get("text", "") for p in decoded
+                                if isinstance(p, dict) and p.get("type") == "text"
+                            ]
+                            text = " ".join(t for t in text_parts if t).strip()
+                            preview = text or "[multimodal content]"
+                        elif isinstance(decoded, str):
+                            preview = decoded
+                        else:
+                            preview = ""
+                        context_msgs.append(
+                            {"role": r["role"], "content": preview[:200]}
+                        )
+                match["context"] = context_msgs
+            except Exception:
+                match["context"] = []
+
+        # Remove full content from result (snippet is enough, saves tokens)
+        for match in matches:
+            match.pop("content", None)
+
+        return matches
+
+    def search_sessions_by_id(
+        self,
+        query: str,
+        limit: int = 20,
+        include_archived: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Search surfaced sessions by exact/prefix/substring session id.
+
+        Desktop search uses this alongside FTS message search so users can paste
+        a session id from logs, CLI output, or another Hermes surface and jump
+        straight to that conversation.  Matching also checks ``_lineage_root_id``
+        for projected compression-chain tips, so an old root id still resolves to
+        the live continuation row.
+        """
+        needle = (query or "").strip().lower()
+        if not needle or limit <= 0:
+            return []
+
+        # SQL-bounded: list_sessions_rich pushes the id LIKE filter into the
+        # query (matching the row's own id AND any id in its forward
+        # compression chain), so we only materialize matching rows instead of
+        # scanning every session. Fetch a small multiple of `limit` so the
+        # in-Python exact/prefix/substring ranking below has enough candidates
+        # to order, then truncate.
+        candidates = self.list_sessions_rich(
+            limit=max(limit * 4, limit),
+            offset=0,
+            include_archived=include_archived,
+            order_by_last_active=True,
+            id_query=needle,
+        )
+
+        def score(row: Dict[str, Any]) -> int:
+            ids = [str(row.get("id") or ""), str(row.get("_lineage_root_id") or "")]
+            normalized = [value.lower() for value in ids if value]
+            if any(value == needle for value in normalized):
+                return 0
+            if any(value.startswith(needle) for value in normalized):
+                return 1
+            return 2
+
+        ranked = sorted(
+            enumerate(candidates),
+            key=lambda item: (score(item[1]), item[0]),
+        )
+        return [row for _, row in ranked[:limit]]
+
+    def search_sessions(
+        self,
+        source: str = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List sessions, optionally filtered by source.
+
+        Returns rows enriched with a computed ``last_active`` column (latest
+        message timestamp for the session, falling back to ``started_at``),
+        ordered by most-recently-used first.
+        """
+        select_with_last_active = (
+            "SELECT s.*, COALESCE(m.last_active, s.started_at) AS last_active "
+            "FROM sessions s "
+            "LEFT JOIN ("
+            "SELECT session_id, MAX(timestamp) AS last_active "
+            "FROM messages GROUP BY session_id"
+            ") m ON m.session_id = s.id "
+        )
+        with self._lock:
+            if source:
+                cursor = self._conn.execute(
+                    f"{select_with_last_active}"
+                    "WHERE s.source = ? "
+                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                    (source, limit, offset),
+                )
+            else:
+                cursor = self._conn.execute(
+                    f"{select_with_last_active}"
+                    "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                )
+            return [dict(row) for row in cursor.fetchall()]
+
+    # =========================================================================
+    # RT-01 Phase 2: Gateway session index and resume state (B/C)
+    # =========================================================================
+
+    def migration_is_complete(self) -> bool:
+        """Return True if RT01-B/C migration has reached phase M3."""
+        if not hasattr(self, "_migration_engine"):
+            return False
+        return MigrationState.is_migration_complete(self._conn)
+
+    def get_gateway_session(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Look up a gateway session index entry by session_key."""
+        if not hasattr(self, "_migration_engine"):
+            return None
+        return self._migration_engine.get_gateway_session(session_key)
+
+    def upsert_gateway_session(
+        self,
+        session_key: str,
+        session_id: str,
+        created_at: float,
+        updated_at: float,
+        platform: Optional[str] = None,
+        chat_type: str = "dm",
+        display_name: Optional[str] = None,
+    ) -> None:
+        """Persist a gateway session key -> session_id mapping."""
+        if not hasattr(self, "_migration_engine"):
+            return
+        return self._migration_engine.upsert_gateway_session(
+            session_key, session_id, created_at, updated_at, platform, chat_type, display_name
+        )
+
+    def delete_gateway_session(self, session_key: str) -> bool:
+        """Delete a gateway session index entry."""
+        if not hasattr(self, "_migration_engine"):
+            return False
+        return self._migration_engine.delete_gateway_session(session_key)
+
+    def list_gateway_sessions(self) -> List[Dict[str, Any]]:
+        """List all gateway session index entries."""
+        if not hasattr(self, "_migration_engine"):
+            return []
+        return self._migration_engine.list_gateway_sessions()
+
+    def get_resume_state(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get resume/suspended state for a session from state.db."""
+        if not hasattr(self, "_migration_engine"):
+            return None
+        return self._migration_engine.get_resume_state(session_id)
+
+    def set_resume_pending(self, session_id: str, reason: str = "restart_timeout") -> bool:
+        """Mark a session as resume_pending in state.db."""
+        if not hasattr(self, "_migration_engine"):
+            return False
+        return self._migration_engine.set_resume_pending(session_id, reason)
+
+    def clear_resume_pending(self, session_id: str) -> bool:
+        """Clear resume_pending for a session in state.db."""
+        if not hasattr(self, "_migration_engine"):
+            return False
+        return self._migration_engine.clear_resume_pending(session_id)
+
+    def set_suspended(self, session_id: str) -> bool:
+        """Mark a session as suspended in state.db."""
+        if not hasattr(self, "_migration_engine"):
+            return False
+        return self._migration_engine.set_suspended(session_id)
+
+    def log_recovery_event(
+        self,
+        session_key: str,
+        session_id: Optional[str],
+        event_type: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Log a recovery event to session_recovery_log."""
+        if not hasattr(self, "_migration_engine"):
+            return
+        self._migration_engine.log_recovery_event(session_key, session_id, event_type, reason)
+
+    # =========================================================================
+    # Utility
+    # =========================================================================
+
+    def session_count(
+        self,
+        source: str = None,
+        min_message_count: int = 0,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        exclude_children: bool = False,
+        exclude_sources: List[str] = None,
+    ) -> int:
+        """Count sessions, optionally filtered by source.
+
+        Pass ``exclude_children=True`` to count only the conversations that
+        ``list_sessions_rich`` surfaces (root + branch sessions), hiding
+        sub-agent runs and compression continuations. Use it whenever the count
+        is paired with a ``list_sessions_rich`` page (e.g. sidebar "load more"
+        totals) so the total matches the number of listable rows — otherwise the
+        raw row count is inflated by children and "load more" never settles.
+
+        Pass ``exclude_sources`` to drop whole source classes from the count
+        (e.g. ``["cron"]`` so the recents "load more" total matches a
+        cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
+        stuck on for buried scheduler sessions).
+        """
+        where_clauses = []
+        params = []
+
+        if exclude_children:
+            # Mirror list_sessions_rich's child-exclusion clause exactly so the
+            # count lines up with the rows: roots (no parent) plus branch
+            # children (parent ended with end_reason='branched').
+            where_clauses.append(_LISTABLE_CHILD_SQL)
+            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        if exclude_sources:
+            placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({placeholders})")
+            params.extend(exclude_sources)
+        if min_message_count > 0:
+            where_clauses.append("s.message_count >= ?")
+            params.append(min_message_count)
+        if archived_only:
+            where_clauses.append("s.archived = 1")
+        elif not include_archived:
+            where_clauses.append("s.archived = 0")
+
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        with self._lock:
+            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions s{where_sql}", params)
+            return cursor.fetchone()[0]
+
+    def message_count(self, session_id: str = None) -> int:
+        """Count messages, optionally for a specific session."""
+        with self._lock:
+            if session_id:
+                cursor = self._conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+                )
+            else:
+                cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
+            return cursor.fetchone()[0]
+
+    # =========================================================================
+    # Export and cleanup
+    # =========================================================================
+
+    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Export a single session with all its messages as a dict."""
+        session = self.get_session(session_id)
+        if not session:
+            return None
+        messages = self.get_messages(session_id)
+        return {**session, "messages": messages}
+
+    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+        """
+        Export all sessions (with messages) as a list of dicts.
+        Suitable for writing to a JSONL file for backup/analysis.
+        """
+        sessions = self.search_sessions(source=source, limit=100000)
+        results = []
+        for session in sessions:
+            messages = self.get_messages(session["id"])
+            results.append({**session, "messages": messages})
+        return results
+
+    def clear_messages(self, session_id: str) -> None:
+        """Delete all messages for a session and reset its counters."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?", (session_id,)
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
+                (session_id,),
+            )
+        self._execute_write(_do)
+
+    @staticmethod
+    def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
+        """Remove on-disk transcript files for a session.
+
+        Cleans up ``{session_id}.json``, ``{session_id}.jsonl``, and any
+        ``request_dump_{session_id}_*.json`` files left by the gateway.
+        Silently skips files that don't exist and swallows OSError so a
+        filesystem hiccup never blocks a DB operation.
+        """
+        if sessions_dir is None:
+            return
+        # Security: session_id is interpolated straight into filesystem paths
+        # (and a glob) below. A malicious/garbage id with a path separator,
+        # parent ref, NUL, or glob metacharacter could delete files OUTSIDE
+        # sessions_dir. Reject those, then containment-check each resolved path.
+        if not session_id or re.search(r"[/\\\x00]|\.\.|[*?\[\]]", session_id):
+            logger.warning("refusing transcript cleanup for unsafe session_id %r", session_id)
+            return
+        try:
+            sessions_dir = sessions_dir.resolve()
+        except OSError:
+            return
+        for suffix in (".json", ".jsonl"):
+            p = sessions_dir / f"{session_id}{suffix}"
+            try:
+                if p.resolve().parent != sessions_dir:
+                    continue  # defense-in-depth: never unlink outside sessions_dir
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        # request_dump files use session_id as a prefix component
+        try:
+            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def delete_session(
+        self,
+        session_id: str,
+        sessions_dir: Optional[Path] = None,
+    ) -> bool:
+        """Delete a session and all its messages.
+
+        Delegate subagent children (``model_config._delegate_from``) are
+        cascade-deleted with the parent so they never resurface in session
+        pickers as orphaned rows. Branch / compression children are orphaned
+        (``parent_session_id → NULL``) so they remain accessible independently.
+        When *sessions_dir* is provided, also removes on-disk transcript
+        files (``.json`` / ``.jsonl`` / ``request_dump_*``) for every deleted
+        session. Returns True if the session was found and deleted.
+        """
+        removed_delegate_ids: List[str] = []
+
+        def _do(conn):
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+            )
+            if cursor.fetchone()[0] == 0:
+                return False
+            removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
+            # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
+            conn.execute(
+                "UPDATE sessions SET parent_session_id = NULL "
+                "WHERE parent_session_id = ?",
+                (session_id,),
+            )
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return True
+
+        deleted = self._execute_write(_do)
+        if deleted:
+            for delegate_id in removed_delegate_ids:
+                self._remove_session_files(sessions_dir, delegate_id)
+            self._remove_session_files(sessions_dir, session_id)
+        return bool(deleted)
+
+    def delete_session_if_empty(
+        self,
+        session_id: str,
+        sessions_dir: Optional[Path] = None,
+    ) -> bool:
+        """Delete *session_id* only when it never gained resumable content.
+
+        A session is considered empty when it has no messages and no
+        user-assigned title. Used by CLI exit / session-rotation paths so
+        immediately-started-and-quit sessions don't pile up in ``/resume``
+        and ``hermes sessions list`` output. (Pattern ported from
+        google-gemini/gemini-cli#27770.)
+
+        The emptiness check and delete run in one transaction, so a message
+        flushed concurrently by another writer can't be lost. Sessions with
+        children (delegate subagent runs) are preserved — a parent that
+        spawned work is not "empty" even if its own transcript never
+        flushed. Returns True if the session was deleted.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                DELETE FROM sessions
+                WHERE id = ?
+                  AND title IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM sessions child
+                      WHERE child.parent_session_id = sessions.id
+                  )
+                """,
+                (session_id,),
+            )
+            return cursor.rowcount > 0
+
+        deleted = self._execute_write(_do)
+        if deleted:
+            self._remove_session_files(sessions_dir, session_id)
+        return bool(deleted)
+
+    def delete_sessions(
+        self,
+        session_ids: List[str],
+        sessions_dir: Optional[Path] = None,
+    ) -> int:
+        """Delete every session in *session_ids* in a single transaction.
+
+        Backs the dashboard's bulk-select-then-delete flow on the
+        sessions page (``POST /api/sessions/bulk-delete``). Mirrors the
+        single-session :meth:`delete_session` contract per row:
+
+        * Unknown IDs are silently skipped (no 404) — selection state
+          in the UI can race against another tab's delete, and we'd
+          rather succeed-on-the-rest than fail-the-whole-batch.
+        * Delegate subagent children (``model_config._delegate_from``) are
+          cascade-deleted with their parent; branch children are orphaned
+          (``parent_session_id → NULL``) so they stay accessible.
+        * Messages and the session row both go in one
+          ``_execute_write`` call so a partial failure can't leave the
+          DB in a "messages gone but session row still there" state.
+        * On-disk transcript / ``request_dump_*`` files are cleaned up
+          outside the DB transaction when *sessions_dir* is provided,
+          matching :meth:`prune_sessions` and
+          :meth:`delete_empty_sessions`.
+
+        Returns the count of sessions that actually existed and were
+        deleted (may be less than ``len(session_ids)`` if some IDs were
+        already gone).
+        """
+        if not session_ids:
+            return 0
+        # Dedup + drop any non-string entries up-front. Avoids
+        # double-counting in the WHERE-IN list and protects against
+        # callers that pass a list with stray ``None`` values.
+        unique_ids = list({sid for sid in session_ids if isinstance(sid, str) and sid})
+        if not unique_ids:
+            return 0
+
+        removed_ids: list[str] = []
+        removed_delegate_ids: list[str] = []
+
+        def _do(conn):
+            placeholders = ",".join("?" * len(unique_ids))
+            # First, filter to IDs that actually exist — we want to
+            # return the real deleted count, not the input length.
+            cursor = conn.execute(
+                f"SELECT id FROM sessions WHERE id IN ({placeholders})",
+                unique_ids,
+            )
+            existing = [row["id"] for row in cursor.fetchall()]
+            if not existing:
+                return 0
+
+            existing_placeholders = ",".join("?" * len(existing))
+            removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
+            # Orphan remaining children whose parent is in the kill list so the
+            # FK constraint stays satisfied. Pin children whose parent
+            # is itself in the kill list rather than NULL-ing parents
+            # of survivors — the IN list on ``parent_session_id`` does
+            # exactly this.
+            conn.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({existing_placeholders})",
+                existing,
+            )
+            conn.execute(
+                f"DELETE FROM messages WHERE session_id IN ({existing_placeholders})",
+                existing,
+            )
+            conn.execute(
+                f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
+                existing,
+            )
+            removed_ids.extend(existing)
+            return len(existing)
+
+        count = self._execute_write(_do)
+        for sid in removed_delegate_ids:
+            self._remove_session_files(sessions_dir, sid)
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+        return count
+
+    def count_empty_sessions(self) -> int:
+        """Return the count of empty, non-active, non-archived sessions.
+
+        "Empty" = ``message_count = 0`` AND the session has ended
+        (``ended_at IS NOT NULL``) AND is not archived. The ``ended_at``
+        guard matches the safety contract used by :meth:`prune_sessions`:
+        only ended sessions are candidates for bulk deletion, so a freshly
+        spawned session whose first message hasn't landed yet — or one
+        held open by the live agent — is never sniped out from under
+        the runtime.
+
+        Backs the ``GET /api/sessions/empty/count`` endpoint that lets the
+        web dashboard hide its "Delete empty" button when there's nothing
+        to clean up, and pre-populate the confirm dialog with the actual
+        count.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT COUNT(*) FROM sessions "
+                "WHERE message_count = 0 "
+                "AND ended_at IS NOT NULL "
+                "AND archived = 0"
+            )
+            return cursor.fetchone()[0]
+
+    def delete_empty_sessions(
+        self,
+        sessions_dir: Optional[Path] = None,
+    ) -> int:
+        """Delete every empty, ended, non-archived session.
+
+        Mirrors :meth:`prune_sessions`' transactional shape:
+
+        * Selects candidate IDs first (``message_count = 0`` AND
+          ``ended_at IS NOT NULL`` AND ``archived = 0``) so we never
+          touch a live session or one the user deliberately archived.
+        * Orphans any child whose parent is in the kill list — children
+          of an empty parent are kept and re-parented to ``NULL`` rather
+          than cascade-deleted, matching ``delete_session`` /
+          ``prune_sessions`` semantics so branch/subagent transcripts
+          survive an inadvertent parent cleanup.
+        * Deletes the rows in a single ``_execute_write`` callback so
+          the operation is atomic — a partial failure (e.g. SIGKILL
+          mid-loop) doesn't leave the DB in a "messages-deleted but
+          session-row-still-there" half-state.
+        * Cleans up on-disk transcript files (``.json`` / ``.jsonl`` /
+          ``request_dump_*``) outside the DB transaction when
+          ``sessions_dir`` is provided. Empty sessions don't typically
+          have transcript files, but the gateway can leave a stub
+          ``request_dump_*`` if it crashed before the first reply —
+          so we still sweep, matching ``prune_sessions``.
+
+        Returns the number of sessions deleted.
+        """
+        removed_ids: list[str] = []
+
+        def _do(conn):
+            cursor = conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE message_count = 0 "
+                "AND ended_at IS NOT NULL "
+                "AND archived = 0"
+            )
+            session_ids = {row["id"] for row in cursor.fetchall()}
+
+            if not session_ids:
+                return 0
+
+            placeholders = ",".join("?" * len(session_ids))
+            conn.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({placeholders})",
+                list(session_ids),
+            )
+
+            for sid in session_ids:
+                # DELETE FROM messages is paranoia — by construction
+                # these rows have ``message_count = 0`` — but if a
+                # bookkeeping bug ever lets the counter drift below the
+                # real row count, we still leave a clean FK state.
+                conn.execute(
+                    "DELETE FROM messages WHERE session_id = ?", (sid,)
+                )
+                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+                removed_ids.append(sid)
+            return len(session_ids)
+
+        count = self._execute_write(_do)
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+        return count
+
+    def prune_sessions(
+        self,
+        older_than_days: int = 90,
+        source: str = None,
+        sessions_dir: Optional[Path] = None,
+    ) -> int:
+        """Delete sessions older than N days. Returns count of deleted sessions.
+
+        Only prunes ended sessions (not active ones).  Child sessions outside
+        the prune window are orphaned (parent_session_id set to NULL) rather
+        than cascade-deleted.  When *sessions_dir* is provided, also removes
+        on-disk transcript files (``.json`` / ``.jsonl`` /
+        ``request_dump_*``) for every pruned session, outside the DB
+        transaction.
+        """
+        cutoff = time.time() - (older_than_days * 86400)
+        removed_ids: list[str] = []
+
+        def _do(conn):
+            if source:
+                cursor = conn.execute(
+                    """SELECT id FROM sessions
+                       WHERE started_at < ? AND ended_at IS NOT NULL AND source = ?""",
+                    (cutoff, source),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
+                    (cutoff,),
+                )
+            session_ids = {row["id"] for row in cursor.fetchall()}
+
+            if not session_ids:
+                return 0
+
+            # Orphan any sessions whose parent is about to be deleted
+            placeholders = ",".join("?" * len(session_ids))
+            conn.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({placeholders})",
+                list(session_ids),
+            )
+
+            for sid in session_ids:
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+                removed_ids.append(sid)
+            return len(session_ids)
+
+        count = self._execute_write(_do)
+        # Clean up on-disk files outside the DB transaction
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+        return count
+
+    # ── Meta key/value (for scheduler bookkeeping) ──
+
+    def get_meta(self, key: str) -> Optional[str]:
+        """Read a value from the state_meta key/value store."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+        if row is None:
+            return None
+        return row["value"] if isinstance(row, sqlite3.Row) else row[0]
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Write a value to the state_meta key/value store."""
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+        self._execute_write(_do)
+
+    def apply_telegram_topic_migration(self) -> None:
+        """Create Telegram DM topic-mode tables on explicit /topic opt-in.
+
+        This migration is deliberately not part of automatic SessionDB startup
+        reconciliation. Operators must be able to upgrade Hermes, keep the old
+        Telegram bot behavior running, and only mutate topic-mode state when the
+        user executes /topic to opt into the feature.
+
+        Schema versions:
+          v1 — initial shape (no ON DELETE CASCADE on session_id FK)
+          v2 — session_id FK gets ON DELETE CASCADE so session pruning
+               automatically clears bindings.
+        """
+        def _do(conn):
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS telegram_dm_topic_mode (
+                    chat_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    activated_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    has_topics_enabled INTEGER,
+                    allows_users_to_create_topics INTEGER,
+                    capability_checked_at REAL,
+                    intro_message_id TEXT,
+                    pinned_message_id TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS telegram_dm_topic_bindings (
+                    chat_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    session_key TEXT NOT NULL,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    managed_mode TEXT NOT NULL DEFAULT 'auto',
+                    linked_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (chat_id, thread_id)
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_session
+                ON telegram_dm_topic_bindings(session_id);
+
+                CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
+                ON telegram_dm_topic_bindings(user_id, chat_id);
+                """
+            )
+
+            # v1 → v2: rebuild telegram_dm_topic_bindings if its session_id FK
+            # lacks ON DELETE CASCADE. SQLite can't ALTER a foreign key, so we
+            # rebuild the table. Only runs once per DB (version gate).
+            current = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                ("telegram_dm_topic_schema_version",),
+            ).fetchone()
+            current_version = int(current[0]) if current and str(current[0]).isdigit() else 0
+            if current_version < 2:
+                fk_rows = conn.execute(
+                    "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
+                ).fetchall()
+                needs_rebuild = any(
+                    row[2] == "sessions" and (row[6] or "") != "CASCADE"
+                    for row in fk_rows
+                )
+                if needs_rebuild:
+                    conn.executescript(
+                        """
+                        CREATE TABLE telegram_dm_topic_bindings_new (
+                            chat_id TEXT NOT NULL,
+                            thread_id TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            session_key TEXT NOT NULL,
+                            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                            managed_mode TEXT NOT NULL DEFAULT 'auto',
+                            linked_at REAL NOT NULL,
+                            updated_at REAL NOT NULL,
+                            PRIMARY KEY (chat_id, thread_id)
+                        );
+                        INSERT INTO telegram_dm_topic_bindings_new
+                            SELECT chat_id, thread_id, user_id, session_key,
+                                   session_id, managed_mode, linked_at, updated_at
+                            FROM telegram_dm_topic_bindings;
+                        DROP TABLE telegram_dm_topic_bindings;
+                        ALTER TABLE telegram_dm_topic_bindings_new
+                            RENAME TO telegram_dm_topic_bindings;
+                        CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session
+                            ON telegram_dm_topic_bindings(session_id);
+                        CREATE INDEX idx_telegram_dm_topic_bindings_user
+                            ON telegram_dm_topic_bindings(user_id, chat_id);
+                        """
+                    )
+
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("telegram_dm_topic_schema_version", "2"),
+            )
+        self._execute_write(_do)
+
+    def enable_telegram_topic_mode(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        has_topics_enabled: Optional[bool] = None,
+        allows_users_to_create_topics: Optional[bool] = None,
+    ) -> None:
+        """Enable Telegram DM topic mode for one private chat/user.
+
+        This method intentionally owns the explicit topic migration. Ordinary
+        SessionDB startup must not create these side tables.
+        """
+        self.apply_telegram_topic_migration()
+        now = time.time()
+
+        def _to_int(value: Optional[bool]) -> Optional[int]:
+            if value is None:
+                return None
+            return 1 if value else 0
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO telegram_dm_topic_mode (
+                    chat_id, user_id, enabled, activated_at, updated_at,
+                    has_topics_enabled, allows_users_to_create_topics,
+                    capability_checked_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    enabled = 1,
+                    updated_at = excluded.updated_at,
+                    has_topics_enabled = excluded.has_topics_enabled,
+                    allows_users_to_create_topics = excluded.allows_users_to_create_topics,
+                    capability_checked_at = excluded.capability_checked_at
+                """,
+                (
+                    str(chat_id),
+                    str(user_id),
+                    now,
+                    now,
+                    _to_int(has_topics_enabled),
+                    _to_int(allows_users_to_create_topics),
+                    now,
+                ),
+            )
+        self._execute_write(_do)
+
+    def disable_telegram_topic_mode(
+        self,
+        *,
+        chat_id: str,
+        clear_bindings: bool = True,
+    ) -> None:
+        """Disable Telegram DM topic mode for one private chat.
+
+        When ``clear_bindings`` is True (default) the (chat_id, thread_id)
+        bindings for this chat are also cleared so re-enabling later
+        starts from a clean slate. Set to False if the operator wants to
+        preserve bindings for a later re-enable.
+
+        Never creates the topic-mode tables from scratch; if they don't
+        exist there is nothing to disable and the call is a no-op.
+        """
+        def _do(conn):
+            try:
+                conn.execute(
+                    "UPDATE telegram_dm_topic_mode SET enabled = 0, updated_at = ? "
+                    "WHERE chat_id = ?",
+                    (time.time(), str(chat_id)),
+                )
+                if clear_bindings:
+                    conn.execute(
+                        "DELETE FROM telegram_dm_topic_bindings WHERE chat_id = ?",
+                        (str(chat_id),),
+                    )
+            except sqlite3.OperationalError:
+                # Tables don't exist yet — nothing to disable.
+                return
+        self._execute_write(_do)
+
+    def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str) -> bool:
+        """Return whether Telegram DM topic mode is enabled for this chat/user."""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT enabled FROM telegram_dm_topic_mode
+                    WHERE chat_id = ? AND user_id = ?
+                    """,
+                    (str(chat_id), str(user_id)),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return False
+        if row is None:
+            return False
+        enabled = row["enabled"] if isinstance(row, sqlite3.Row) else row[0]
+        return bool(enabled)
+
+    def get_telegram_topic_binding(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the session binding for a Telegram DM topic, if present."""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM telegram_dm_topic_bindings
+                    WHERE chat_id = ? AND thread_id = ?
+                    """,
+                    (str(chat_id), str(thread_id)),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        return dict(row) if row else None
+
+    def list_telegram_topic_bindings_for_chat(
+        self,
+        *,
+        chat_id: str,
+    ) -> List[Dict[str, Any]]:
+        """All Telegram DM topic bindings for one chat, newest first.
+
+        Read-only; returns [] if the bindings table doesn't exist yet
+        (does not trigger the topic-mode migration).
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT * FROM telegram_dm_topic_bindings "
+                    "WHERE chat_id = ? ORDER BY updated_at DESC",
+                    (str(chat_id),),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
+
+    def get_telegram_topic_binding_by_session(
+        self,
+        *,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the Telegram DM topic binding for a given session_id, if present.
+
+        Uses the UNIQUE INDEX on telegram_dm_topic_bindings(session_id) for an
+        efficient reverse lookup. Returns None when the session has no binding or
+        the table does not exist yet.
+        """
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM telegram_dm_topic_bindings
+                    WHERE session_id = ?
+                    """,
+                    (str(session_id),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+        return dict(row) if row else None
+
+    def bind_telegram_topic(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+        user_id: str,
+        session_key: str,
+        session_id: str,
+        managed_mode: str = "auto",
+    ) -> None:
+        """Bind one Telegram DM topic thread to one Hermes session.
+
+        A Hermes session may only be linked to one Telegram topic in MVP.
+        Rebinding the same topic to the same session is idempotent; trying to
+        link the same session to a different topic raises ValueError.
+        """
+        self.apply_telegram_topic_migration()
+        now = time.time()
+        chat_id = str(chat_id)
+        thread_id = str(thread_id)
+        user_id = str(user_id)
+        session_key = str(session_key)
+        session_id = str(session_id)
+
+        def _do(conn):
+            existing_session = conn.execute(
+                """
+                SELECT chat_id, thread_id FROM telegram_dm_topic_bindings
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if existing_session is not None:
+                linked_chat = existing_session["chat_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[0]
+                linked_thread = existing_session["thread_id"] if isinstance(existing_session, sqlite3.Row) else existing_session[1]
+                if str(linked_chat) != chat_id or str(linked_thread) != thread_id:
+                    raise ValueError("session is already linked to another Telegram topic")
+
+            conn.execute(
+                """
+                INSERT INTO telegram_dm_topic_bindings (
+                    chat_id, thread_id, user_id, session_key, session_id,
+                    managed_mode, linked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    session_key = excluded.session_key,
+                    session_id = excluded.session_id,
+                    managed_mode = excluded.managed_mode,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    chat_id,
+                    thread_id,
+                    user_id,
+                    session_key,
+                    session_id,
+                    managed_mode,
+                    now,
+                    now,
+                ),
+            )
+        self._execute_write(_do)
+
+    def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
+        """Return True if a Hermes session is already bound to any Telegram DM topic.
+
+        Read-only: does NOT trigger the telegram-topic migration. If the
+        topic-mode tables have not been created yet (i.e. nobody has run
+        ``/topic`` in this profile), the session is by definition unbound
+        and we return False.
+        """
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    """
+                    SELECT 1 FROM telegram_dm_topic_bindings
+                    WHERE session_id = ?
+                    LIMIT 1
+                    """,
+                    (str(session_id),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return False
+        return row is not None
+
+    def list_unlinked_telegram_sessions_for_user(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """List previous Telegram sessions for this user that are not bound to a topic.
+
+        Read-only: does NOT trigger the telegram-topic migration. If the
+        topic-mode tables are absent, fall back to a simpler query that
+        just returns this user's Telegram sessions — there can't be any
+        bindings yet.
+        """
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT s.*,
+                        COALESCE(
+                            (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                             FROM messages m
+                             WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                             ORDER BY m.timestamp, m.id LIMIT 1),
+                            ''
+                        ) AS _preview_raw,
+                        COALESCE(
+                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                            s.started_at
+                        ) AS last_active
+                    FROM sessions s
+                    WHERE s.source = 'telegram'
+                      AND s.user_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM telegram_dm_topic_bindings b
+                          WHERE b.session_id = s.id
+                      )
+                    ORDER BY last_active DESC, s.started_at DESC
+                    LIMIT ?
+                    """,
+                    (str(user_id), int(limit)),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                # telegram_dm_topic_bindings doesn't exist yet — no bindings
+                # means every telegram session for this user is "unlinked".
+                rows = self._conn.execute(
+                    """
+                    SELECT s.*,
+                        COALESCE(
+                            (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                             FROM messages m
+                             WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                             ORDER BY m.timestamp, m.id LIMIT 1),
+                            ''
+                        ) AS _preview_raw,
+                        COALESCE(
+                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                            s.started_at
+                        ) AS last_active
+                    FROM sessions s
+                    WHERE s.source = 'telegram'
+                      AND s.user_id = ?
+                    ORDER BY last_active DESC, s.started_at DESC
+                    LIMIT ?
+                    """,
+                    (str(user_id), int(limit)),
+                ).fetchall()
+
+        sessions: List[Dict[str, Any]] = []
+        for row in rows:
+            session = dict(row)
+            raw = str(session.pop("_preview_raw", "") or "").strip()
+            session["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
+            sessions.append(session)
+        return sessions
+
+    # ── Space reclamation ──
+
+    # FTS5 virtual tables whose b-tree segments we merge on optimize. The
+    # trigram table is created lazily / may be disabled, so we probe before
+    # touching it (see optimize_fts).
+    _FTS_TABLES = ("messages_fts", "messages_fts_trigram")
+
+    def _fts_table_exists(self, name: str) -> bool:
+        """True if an FTS5 virtual table is queryable in this DB."""
+        try:
+            self._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    def optimize_fts(self) -> int:
+        """Merge fragmented FTS5 b-tree segments into one per index.
+
+        FTS5 indexes grow as a series of incremental segments — one per
+        ``INSERT`` batch driven by the message triggers. Over tens of
+        thousands of messages these segments accumulate, which both bloats
+        the ``*_data`` shadow tables and slows ``MATCH`` queries that must
+        scan every segment. The special ``'optimize'`` command rewrites each
+        index as a single merged segment.
+
+        This is purely a maintenance operation — it changes neither search
+        results nor ``snippet()`` output, only on-disk layout and query
+        speed. It is complementary to VACUUM: ``optimize`` compacts the FTS
+        index internally, then VACUUM returns the freed pages to the OS.
+
+        Skips any FTS table that does not exist (e.g. the trigram index when
+        disabled via ``HERMES_DISABLE_FTS_TRIGRAM`` or not yet created), so
+        it is safe to call unconditionally.
+
+        Returns the number of FTS indexes that were optimized.
+        """
+        optimized = 0
+        with self._lock:
+            for tbl in self._FTS_TABLES:
+                if not self._fts_table_exists(tbl):
+                    continue
+                try:
+                    # The column name in the INSERT must match the table name
+                    # for FTS5 special commands.
+                    self._conn.execute(
+                        f"INSERT INTO {tbl}({tbl}) VALUES('optimize')"
+                    )
+                    optimized += 1
+                except sqlite3.OperationalError as exc:
+                    logger.warning(
+                        "FTS optimize failed for %s: %s", tbl, exc
+                    )
+        return optimized
+
+    def vacuum(self) -> int:
+        """Run VACUUM to reclaim disk space after large deletes.
+
+        SQLite does not shrink the database file when rows are deleted —
+        freed pages just get reused on the next insert. After a prune that
+        removed hundreds of sessions, the file stays bloated unless we
+        explicitly VACUUM.
+
+        VACUUM rewrites the entire DB, so it's expensive (seconds per
+        100MB) and cannot run inside a transaction. It also acquires an
+        exclusive lock, so callers must ensure no other writers are
+        active. Safe to call at startup before the gateway/CLI starts
+        serving traffic.
+
+        FTS5 segments are merged first via :meth:`optimize_fts` so the
+        subsequent VACUUM reclaims the pages freed by the merge. This is a
+        layout-only optimization — search results are unchanged.
+
+        Returns the number of FTS indexes that were optimized (0 if the
+        merge step failed or no FTS tables exist).
+        """
+        # Merge FTS5 segments before VACUUM so the freed pages are returned
+        # to the OS in the same pass. optimize_fts() manages its own lock.
+        optimized = 0
+        try:
+            optimized = self.optimize_fts()
+        except Exception as exc:
+            logger.warning("FTS optimize before VACUUM failed: %s", exc)
+        # VACUUM cannot be executed inside a transaction.
+        with self._lock:
+            # Best-effort WAL checkpoint first, then VACUUM.
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+            self._conn.execute("VACUUM")
+        return optimized
+
+    def maybe_auto_prune_and_vacuum(
+        self,
+        retention_days: int = 90,
+        min_interval_hours: int = 24,
+        vacuum: bool = True,
+        sessions_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
+
+        Records the last run timestamp in state_meta so subsequent calls
+        within ``min_interval_hours`` no-op. Designed to be called once at
+        startup from long-lived entrypoints (CLI, gateway, cron scheduler).
+
+        When *sessions_dir* is provided, on-disk transcript files
+        (``.json`` / ``.jsonl`` / ``request_dump_*``) for pruned sessions
+        are removed as part of the same sweep (issue #3015).
+
+        Never raises. On any failure, logs a warning and returns a dict
+        with ``"error"`` set.
+
+        Returns a dict with keys:
+          - ``"skipped"`` (bool) — true if within min_interval_hours of last run
+          - ``"pruned"`` (int)   — number of sessions deleted
+          - ``"vacuumed"`` (bool) — true if VACUUM ran
+          - ``"error"`` (str, optional) — present only on failure
+        """
+        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        try:
+            # Skip if another process/call did maintenance recently.
+            last_raw = self.get_meta("last_auto_prune")
+            now = time.time()
+            if last_raw:
+                try:
+                    last_ts = float(last_raw)
+                    if now - last_ts < min_interval_hours * 3600:
+                        result["skipped"] = True
+                        return result
+                except (TypeError, ValueError):
+                    pass  # corrupt meta; treat as no prior run
+
+            pruned = self.prune_sessions(
+                older_than_days=retention_days,
+                sessions_dir=sessions_dir,
+            )
+            result["pruned"] = pruned
+
+            # Only VACUUM if we actually freed rows — VACUUM on a tight DB
+            # is wasted I/O. Threshold keeps small DBs from paying the cost.
+            if vacuum and pruned > 0:
+                try:
+                    self.vacuum()
+                    result["vacuumed"] = True
+                except Exception as exc:
+                    logger.warning("state.db VACUUM failed: %s", exc)
+
+            # Record the attempt even if pruned == 0, so we don't retry
+            # every startup within the min_interval_hours window.
+            self.set_meta("last_auto_prune", str(now))
+
+            if pruned > 0:
+                logger.info(
+                    "state.db auto-maintenance: pruned %d session(s) older than %d days%s",
+                    pruned,
+                    retention_days,
+                    " + VACUUM" if result["vacuumed"] else "",
+                )
+        except Exception as exc:
+            # Maintenance must never block startup. Log and return error marker.
+            logger.warning("state.db auto-maintenance failed: %s", exc)
+            result["error"] = str(exc)
+
+        return result
+
+    # ── Handoff (cross-platform session transfer) ──────────────────────────
+    #
+    # State machine:
+    #   None       — no handoff in flight
+    #   "pending"  — CLI requested handoff, gateway hasn't picked it up yet
+    #   "running"  — gateway is processing (session switch + synthetic turn)
+    #   "completed"— gateway successfully delivered the synthetic turn
+    #   "failed"   — gateway hit an error; reason in handoff_error
+    #
+    # The CLI writes "pending" then poll-waits for terminal state. The gateway
+    # watcher transitions pending→running→{completed,failed}.
+
+    def request_handoff(self, session_id: str, platform: str) -> bool:
+        """Mark a session as pending handoff to the given platform.
+
+        Returns True if the row was found and not already in flight; False if
+        the session is already in a non-terminal handoff state.
+        """
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE sessions "
+                "SET handoff_state = 'pending', "
+                "    handoff_platform = ?, "
+                "    handoff_error = NULL "
+                "WHERE id = ? AND (handoff_state IS NULL "
+                "                  OR handoff_state IN ('completed', 'failed'))",
+                (platform, session_id),
+            )
+            return cur.rowcount > 0
+        return self._execute_write(_do)
+
+    def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Read the current handoff state for a session.
+
+        Returns ``{"state", "platform", "error"}`` or None if the session has
+        no handoff record.
+        """
+        try:
+            cur = self._conn.execute(
+                "SELECT handoff_state, handoff_platform, handoff_error "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "state": row["handoff_state"],
+                "platform": row["handoff_platform"],
+                "error": row["handoff_error"],
+            }
+        except Exception:
+            return None
+
+    def list_pending_handoffs(self) -> List[Dict[str, Any]]:
+        """Return all sessions in handoff_state='pending', oldest first.
+
+        Used by the gateway's handoff watcher.
+        """
+        try:
+            cur = self._conn.execute(
+                "SELECT * FROM sessions "
+                "WHERE handoff_state = 'pending' "
+                "ORDER BY started_at ASC"
+            )
+            return [dict(r) for r in cur.fetchall()]
+        except Exception:
+            return []
+
+    def claim_handoff(self, session_id: str) -> bool:
+        """Atomically transition pending → running. Returns True if claimed."""
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE sessions SET handoff_state = 'running' "
+                "WHERE id = ? AND handoff_state = 'pending'",
+                (session_id,),
+            )
+            return cur.rowcount > 0
+        return self._execute_write(_do)
+
+    def complete_handoff(self, session_id: str) -> None:
+        """Mark a handoff as completed."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET handoff_state = 'completed', "
+                "handoff_error = NULL WHERE id = ?",
+                (session_id,),
+            )
+        self._execute_write(_do)
+
+    def fail_handoff(self, session_id: str, error: str) -> None:
+        """Mark a handoff as failed and record the reason."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET handoff_state = 'failed', "
+                "handoff_error = ? WHERE id = ?",
+                (error[:500], session_id),
+            )
+        self._execute_write(_do)

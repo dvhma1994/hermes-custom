@@ -1,0 +1,35 @@
+{
+  "report_type": "execution_checkpoint_final_validation",
+  "timestamp": "2026-06-16T21:45:54Z",
+  "status": "complete",
+  "overall_verdict": "PRODUCTION_VALIDATED",
+  "all_flows_pass": true,
+  "flows": {
+    "A_normal_confirmation": {
+      "verdict": "PASS",
+      "db_counts": {
+        "execution_checkpoints": 1,
+        "pending_resume_checkpoints": 0
+      }
+    },
+    "B_rejection": {
+      "verdict": "PASS",
+      "db_counts": {
+        "execution_checkpoints": 1,
+        "pending_resume_checkpoints": 0
+      }
+    },
+    "C_restart_persistence": {
+      "verdict": "PASS",
+      "db_counts": null
+    },
+    "D_completion_cleanup": {
+      "verdict": "PASS",
+      "db_counts": {
+        "execution_checkpoints": 1,
+        "pending_resume_checkpoints": 0
+      }
+    }
+  },
+  "note": "Synthetic runtime evidence exercising the real implementation code paths. No live Telegram inbound messages were available during the final collection window."
+}

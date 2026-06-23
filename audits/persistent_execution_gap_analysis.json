@@ -1,0 +1,19 @@
+{
+  "architectural_gap": "The agent's core abstraction is a single conversation turn. There is no task-scoped execution loop that survives across gateway messages. Interrupts propagate as a boolean flag that causes the turn to finalize; nothing serializes the turn's internal loop state.",
+  "why_hermes_remembers_but_does_not_continue": "state.db stores messages (transcript memory) but not execution state. On the next message, a fresh AIAgent is instantiated and rebuilds only what it can infer from the transcript. Pending tool calls are gone because they were in-flight, not yet committed as tool results.",
+  "reusable_components": [
+    "SessionDB SQLite persistence layer",
+    "TodoStore in-memory planner + format_for_injection",
+    "ToolExecutor tool-call packaging",
+    "conversation_loop turn lifecycle",
+    "run_agent.py AIAgent.run_conversation entry point"
+  ],
+  "minimal_changes_required": [
+    "Add execution_checkpoints table and SessionDB persistence methods",
+    "Add ExecutionCheckpoint dataclass",
+    "Capture checkpoint on interrupt in conversation_loop.py and tool_executor.py",
+    "Restore checkpoint in turn_context.py build_turn_context",
+    "Wire resume decision through run_agent.py and gateway/run.py",
+    "Delete checkpoint on successful completion / expiration / abandon"
+  ]
+}

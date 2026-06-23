@@ -1,0 +1,22 @@
+{
+  "report_type": "resume_prompt_fix_report",
+  "generated_at": "2026-06-16T20:36:59Z",
+  "defect": {
+    "symptom": "Failed to send resume prompt: There is no current event loop in thread 'asyncio_2'.",
+    "location": "gateway/run.py inside GatewayRunner._resolve_resume_checkpoint_decision",
+    "root_cause": "The code used asyncio.get_event_loop(), which returns the event loop bound to the calling thread. _resolve_resume_checkpoint_decision is called from a thread-pool / sync context ('asyncio_2') that has no bound loop. The gateway's actual asyncio loop is stored in self._gateway_loop (set in the main async run coroutine), but the method ignored it."
+  },
+  "fix": {
+    "description": "Changed the resume-prompt coroutine scheduling to use self._gateway_loop (the gateway's main event loop) as the target loop, falling back to asyncio.get_event_loop() only when the attribute is unavailable.",
+    "file": "gateway/run.py",
+    "lines": "2261-2267",
+    "diff": "- loop = asyncio.get_event_loop()\\n+ loop = getattr(self, \"_gateway_loop\", None) or asyncio.get_event_loop()"
+  },
+  "verification": {
+    "compile_all_modified_files": "PASSED",
+    "test_turn_context": "9 passed",
+    "test_hermes_state": "267 passed",
+    "targeted_test": "tests/agent/test_turn_context.py::TestDefectFixes::test_resolve_resume_uses_gateway_loop - PASSED"
+  },
+  "live_validation_status": "PENDING - waiting for user to send dashboard task, /stop, and reply 'yes' to the prompt so the full lifecycle can be recorded."
+}

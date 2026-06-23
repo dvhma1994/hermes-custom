@@ -1,0 +1,470 @@
+[
+  {
+    "path": "eslint.config.js",
+    "size": 639
+  },
+  {
+    "path": "index.html",
+    "size": 428
+  },
+  {
+    "path": "package.json",
+    "size": 1449
+  },
+  {
+    "path": "public/favicon.ico",
+    "size": 8482
+  },
+  {
+    "path": "public/fonts/Collapse-Bold.woff2",
+    "size": 59144
+  },
+  {
+    "path": "public/fonts/Collapse-Regular.woff2",
+    "size": 62816
+  },
+  {
+    "path": "public/fonts/Mondwest-Regular.woff2",
+    "size": 23828
+  },
+  {
+    "path": "public/fonts/RulesCompressed-Medium.woff2",
+    "size": 38848
+  },
+  {
+    "path": "public/fonts/RulesCompressed-Regular.woff2",
+    "size": 37764
+  },
+  {
+    "path": "public/fonts/RulesExpanded-Bold.woff2",
+    "size": 35012
+  },
+  {
+    "path": "public/fonts/RulesExpanded-Regular.woff2",
+    "size": 33820
+  },
+  {
+    "path": "public/fonts-terminal/JetBrainsMono-Bold.woff2",
+    "size": 94628
+  },
+  {
+    "path": "public/fonts-terminal/JetBrainsMono-Italic.woff2",
+    "size": 96428
+  },
+  {
+    "path": "public/fonts-terminal/JetBrainsMono-Regular.woff2",
+    "size": 92380
+  },
+  {
+    "path": "README.md",
+    "size": 6355
+  },
+  {
+    "path": "src/App.tsx",
+    "size": 39193
+  },
+  {
+    "path": "src/components/AuthWidget.tsx",
+    "size": 4964
+  },
+  {
+    "path": "src/components/AutoField.tsx",
+    "size": 6554
+  },
+  {
+    "path": "src/components/AutomationBlueprints.tsx",
+    "size": 7440
+  },
+  {
+    "path": "src/components/Backdrop.tsx",
+    "size": 6287
+  },
+  {
+    "path": "src/components/ChatSidebar.tsx",
+    "size": 13127
+  },
+  {
+    "path": "src/components/ConfirmDialog.tsx",
+    "size": 3465
+  },
+  {
+    "path": "src/components/DeleteConfirmDialog.tsx",
+    "size": 881
+  },
+  {
+    "path": "src/components/LanguageSwitcher.tsx",
+    "size": 6534
+  },
+  {
+    "path": "src/components/Markdown.tsx",
+    "size": 11233
+  },
+  {
+    "path": "src/components/ModelInfoCard.tsx",
+    "size": 4281
+  },
+  {
+    "path": "src/components/ModelPickerDialog.tsx",
+    "size": 19326
+  },
+  {
+    "path": "src/components/OAuthLoginModal.tsx",
+    "size": 13421
+  },
+  {
+    "path": "src/components/OAuthProvidersCard.tsx",
+    "size": 10847
+  },
+  {
+    "path": "src/components/PlatformsCard.tsx",
+    "size": 3473
+  },
+  {
+    "path": "src/components/ProfileScopeBanner.tsx",
+    "size": 1240
+  },
+  {
+    "path": "src/components/ProfileSwitcher.tsx",
+    "size": 2194
+  },
+  {
+    "path": "src/components/ScheduleBuilder.tsx",
+    "size": 9808
+  },
+  {
+    "path": "src/components/SidebarFooter.tsx",
+    "size": 1290
+  },
+  {
+    "path": "src/components/SidebarStatusStrip.tsx",
+    "size": 2485
+  },
+  {
+    "path": "src/components/SkillEditorDialog.tsx",
+    "size": 7300
+  },
+  {
+    "path": "src/components/SlashPopover.tsx",
+    "size": 5185
+  },
+  {
+    "path": "src/components/ThemeSwitcher.tsx",
+    "size": 12936
+  },
+  {
+    "path": "src/components/ToolCall.tsx",
+    "size": 7030
+  },
+  {
+    "path": "src/components/ToolsetConfigDrawer.tsx",
+    "size": 18125
+  },
+  {
+    "path": "src/contexts/page-header-context.ts",
+    "size": 352
+  },
+  {
+    "path": "src/contexts/PageHeaderProvider.tsx",
+    "size": 4879
+  },
+  {
+    "path": "src/contexts/profile-context.ts",
+    "size": 579
+  },
+  {
+    "path": "src/contexts/ProfileProvider.tsx",
+    "size": 5062
+  },
+  {
+    "path": "src/contexts/system-actions-context.ts",
+    "size": 534
+  },
+  {
+    "path": "src/contexts/SystemActions.tsx",
+    "size": 3837
+  },
+  {
+    "path": "src/contexts/usePageHeader.ts",
+    "size": 351
+  },
+  {
+    "path": "src/contexts/useProfileScope.ts",
+    "size": 179
+  },
+  {
+    "path": "src/contexts/useSystemActions.ts",
+    "size": 384
+  },
+  {
+    "path": "src/hooks/useModalBehavior.ts",
+    "size": 1144
+  },
+  {
+    "path": "src/hooks/useSidebarStatus.ts",
+    "size": 701
+  },
+  {
+    "path": "src/i18n/af.ts",
+    "size": 28460
+  },
+  {
+    "path": "src/i18n/context.tsx",
+    "size": 3205
+  },
+  {
+    "path": "src/i18n/de.ts",
+    "size": 30295
+  },
+  {
+    "path": "src/i18n/en.ts",
+    "size": 29373
+  },
+  {
+    "path": "src/i18n/es.ts",
+    "size": 30003
+  },
+  {
+    "path": "src/i18n/fr.ts",
+    "size": 30795
+  },
+  {
+    "path": "src/i18n/ga.ts",
+    "size": 30697
+  },
+  {
+    "path": "src/i18n/hu.ts",
+    "size": 31141
+  },
+  {
+    "path": "src/i18n/index.ts",
+    "size": 119
+  },
+  {
+    "path": "src/i18n/it.ts",
+    "size": 29833
+  },
+  {
+    "path": "src/i18n/ja.ts",
+    "size": 34566
+  },
+  {
+    "path": "src/i18n/ko.ts",
+    "size": 31020
+  },
+  {
+    "path": "src/i18n/pt.ts",
+    "size": 29981
+  },
+  {
+    "path": "src/i18n/ru.ts",
+    "size": 40906
+  },
+  {
+    "path": "src/i18n/tr.ts",
+    "size": 29668
+  },
+  {
+    "path": "src/i18n/types.ts",
+    "size": 19129
+  },
+  {
+    "path": "src/i18n/uk.ts",
+    "size": 40314
+  },
+  {
+    "path": "src/i18n/zh-hant.ts",
+    "size": 27556
+  },
+  {
+    "path": "src/i18n/zh.ts",
+    "size": 26992
+  },
+  {
+    "path": "src/index.css",
+    "size": 9773
+  },
+  {
+    "path": "src/lib/api.ts",
+    "size": 71986
+  },
+  {
+    "path": "src/lib/dashboard-flags.ts",
+    "size": 930
+  },
+  {
+    "path": "src/lib/format.ts",
+    "size": 382
+  },
+  {
+    "path": "src/lib/fuzzy.ts",
+    "size": 5556
+  },
+  {
+    "path": "src/lib/gatewayClient.ts",
+    "size": 7568
+  },
+  {
+    "path": "src/lib/nested.ts",
+    "size": 825
+  },
+  {
+    "path": "src/lib/resolve-page-title.ts",
+    "size": 1093
+  },
+  {
+    "path": "src/lib/schedule.ts",
+    "size": 13997
+  },
+  {
+    "path": "src/lib/slashExec.ts",
+    "size": 4779
+  },
+  {
+    "path": "src/lib/utils.ts",
+    "size": 1501
+  },
+  {
+    "path": "src/main.tsx",
+    "size": 854
+  },
+  {
+    "path": "src/pages/AnalyticsPage.tsx",
+    "size": 22656
+  },
+  {
+    "path": "src/pages/ChannelsPage.tsx",
+    "size": 29450
+  },
+  {
+    "path": "src/pages/ChatPage.tsx",
+    "size": 37556
+  },
+  {
+    "path": "src/pages/ConfigPage.tsx",
+    "size": 22970
+  },
+  {
+    "path": "src/pages/CronPage.tsx",
+    "size": 32769
+  },
+  {
+    "path": "src/pages/DocsPage.tsx",
+    "size": 2376
+  },
+  {
+    "path": "src/pages/EnvPage.tsx",
+    "size": 30602
+  },
+  {
+    "path": "src/pages/FilesPage.tsx",
+    "size": 19060
+  },
+  {
+    "path": "src/pages/LogsPage.tsx",
+    "size": 8304
+  },
+  {
+    "path": "src/pages/McpPage.tsx",
+    "size": 26612
+  },
+  {
+    "path": "src/pages/ModelsPage.tsx",
+    "size": 38797
+  },
+  {
+    "path": "src/pages/PairingPage.tsx",
+    "size": 9282
+  },
+  {
+    "path": "src/pages/PluginsPage.tsx",
+    "size": 18791
+  },
+  {
+    "path": "src/pages/ProfileBuilderPage.tsx",
+    "size": 23774
+  },
+  {
+    "path": "src/pages/ProfilesPage.tsx",
+    "size": 49407
+  },
+  {
+    "path": "src/pages/SessionsPage.tsx",
+    "size": 59092
+  },
+  {
+    "path": "src/pages/SkillsPage.tsx",
+    "size": 53493
+  },
+  {
+    "path": "src/pages/SystemPage.tsx",
+    "size": 51993
+  },
+  {
+    "path": "src/pages/WebhooksPage.tsx",
+    "size": 22291
+  },
+  {
+    "path": "src/plugins/index.ts",
+    "size": 436
+  },
+  {
+    "path": "src/plugins/PluginPage.tsx",
+    "size": 1820
+  },
+  {
+    "path": "src/plugins/registry.ts",
+    "size": 5660
+  },
+  {
+    "path": "src/plugins/sdk.d.ts",
+    "size": 7177
+  },
+  {
+    "path": "src/plugins/slots.ts",
+    "size": 7191
+  },
+  {
+    "path": "src/plugins/types.ts",
+    "size": 1178
+  },
+  {
+    "path": "src/plugins/usePlugins.ts",
+    "size": 4754
+  },
+  {
+    "path": "src/themes/context.tsx",
+    "size": 22192
+  },
+  {
+    "path": "src/themes/fonts.ts",
+    "size": 6117
+  },
+  {
+    "path": "src/themes/index.ts",
+    "size": 389
+  },
+  {
+    "path": "src/themes/presets.ts",
+    "size": 19871
+  },
+  {
+    "path": "src/themes/types.ts",
+    "size": 9249
+  },
+  {
+    "path": "tsconfig.app.json",
+    "size": 836
+  },
+  {
+    "path": "tsconfig.json",
+    "size": 126
+  },
+  {
+    "path": "tsconfig.node.json",
+    "size": 679
+  },
+  {
+    "path": "vite.config.ts",
+    "size": 3453
+  }
+]

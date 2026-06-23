@@ -1,0 +1,57 @@
+{
+  "report_type": "root_cause_fix_report",
+  "generated_at": "2026-06-16T20:23:32Z",
+  "defects": [
+    {
+      "id": 1,
+      "location": "agent/conversation_loop.py line 3693",
+      "description": "interrupted_during_api_call path broke the loop without persisting an execution checkpoint.",
+      "fix": "Inserted _capture_execution_checkpoint() before break, using the same state parameters as the other interrupt paths.",
+      "commit_path": "agent/conversation_loop.py",
+      "test": "tests/agent/test_turn_context.py::TestDefectFixes::test_interrupted_during_api_call_creates_checkpoint - PASSED"
+    },
+    {
+      "id": 2,
+      "location": "gateway/run.py",
+      "description": "_resolve_resume_checkpoint_decision() was defined at module scope, not as a GatewayRunner method, causing AttributeError.",
+      "fix": "Relocated _resolve_resume_checkpoint_decision inside the GatewayRunner class definition.",
+      "commit_path": "gateway/run.py",
+      "test": "tests/agent/test_turn_context.py::TestDefectFixes::test_gateway_runner_has_resolve_resume_method - PASSED"
+    }
+  ],
+  "verification": {
+    "compile_all_modified_files": "PASSED",
+    "tests_turn_context_full": "8 passed",
+    "tests_hermes_state": "267 passed",
+    "targeted_defect_tests": "2 passed"
+  },
+  "runtime_evidence": {
+    "gateway_pid": 17700,
+    "dashboard_task_sent": "2026-06-16 23:20:01",
+    "stop_command": "2026-06-16 23:20:12 (stop_command)",
+    "checkpoint_save_log": "2026-06-16 23:20:12,684 INFO agent.conversation_loop: Execution checkpoint saved: task=20260616_212538_d85457 reason=interrupted_during_api_call",
+    "checkpoint_row": {
+      "task_id": "20260616_212538_d85457",
+      "session_id": "20260616_212538_d85457",
+      "api_call_count_at_save": 1,
+      "turn_exit_reason": "interrupted_during_api_call"
+    },
+    "continue_message": "2026-06-16 23:20:20",
+    "resume_decision_log": "2026-06-16 23:20:20,934 INFO gateway.run: Resuming checkpoint for task=20260616_212538_d85457 (continuation keyword)",
+    "resume_load_log": "2026-06-16 23:20:20,936 INFO agent.turn_context: Resuming execution checkpoint for task=20260616_212538_d85457 reason=interrupted_during_api_call",
+    "resumed_session_id": "20260616_212538_d85457",
+    "api_call_count_after_resume": 1,
+    "pending_tool_calls_at_save": [],
+    "tools_executed_after_resume": [
+      "todo",
+      "execute_code"
+    ],
+    "task_restarted_from_scratch": false,
+    "resume_prompt": {
+      "attempted": true,
+      "delivery_error": "Failed to send resume prompt: There is no current event loop in thread 'asyncio_2'.",
+      "fallback": "continuation keyword heuristic resumed automatically"
+    }
+  },
+  "conclusion": "A true checkpoint resume occurred. The same session/task_id was reused, API call counter was restored to 1, and tool execution continued (todo, execute_code) after the 'continue' message. The task did not restart from scratch. Completion/deletion evidence is pending because the user sent a second /stop before the task finished."
+}

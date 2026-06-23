@@ -1,0 +1,28 @@
+{
+  "feature": "Execution Checkpoint resume",
+  "end_to_end_status": "PARTIALLY VERIFIED",
+  "component_verification": {
+    "compile_all_modified_files": "PASSED",
+    "import_all_modified_modules": "PASSED",
+    "state_db_checkpoint_roundtrip": "PASSED",
+    "turn_context_resume_synthetic": "PASSED",
+    "pytest_test_turn_context": "8 passed",
+    "pytest_test_hermes_state": "267 passed",
+    "targeted_defect_tests": "2 passed",
+    "dashboard_interruption_simulation": "PASSED",
+    "live_gateway_telegram": "PARTIALLY VERIFIED - checkpoint save/load/resume confirmed; completion/deletion pending"
+  },
+  "defect_fixes": [
+    {
+      "defect": "Checkpoint creation skipped for interrupted_during_api_call",
+      "status": "FIXED",
+      "evidence": "Log: 'Execution checkpoint saved: task=20260616_212538_d85457 reason=interrupted_during_api_call' and DB row exists"
+    },
+    {
+      "defect": "GatewayRunner lacked _resolve_resume_checkpoint_decision method",
+      "status": "FIXED",
+      "evidence": "Log: 'Resuming checkpoint for task=20260616_212538_d85457 (continuation keyword)' after method call succeeded"
+    }
+  ],
+  "remaining_gap": "Resume prompt delivery fails in secondary asyncio thread; falls back to keyword auto-resume. Also completion/deletion not yet exercised end-to-end."
+}
