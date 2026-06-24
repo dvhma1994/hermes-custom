@@ -1,0 +1,32 @@
+{
+  "feature": "Persistent Execution Checkpoints",
+  "goal": "Make Hermes resume a long-running task from a persisted execution checkpoint instead of transcript reconstruction alone.",
+  "persistence_target": "state.db execution_checkpoints table",
+  "checkpoint_lifetime": "24 hours (configurable TTL)",
+  "capture_triggers": [
+    "user interrupt during conversation loop (_interrupt_requested)",
+    "tool batch interrupted mid-execution (concurrent/sequential cancellation)"
+  ],
+  "restored_state": {
+    "execution_state": "api_call_count, iteration_budget_used, max_iterations, retry_counters, compression_count",
+    "todo_state": "serialized TodoStore items (merge=True)",
+    "tool_state": "pending_tool_calls, tool_batch_order, cancelled_tool_calls",
+    "file_modifications": "not tracked (intentional; no filesystem snapshot)",
+    "iteration_count": "persisted via api_call_count + iteration_budget_used",
+    "reasoning_context": "last persisted message snapshot + resumed user/assistant messages"
+  },
+  "resume_flow": [
+    "1. build_turn_context checks for existing checkpoint for effective_task_id",
+    "2. If caller passes resume_checkpoint_decision='resume' or heuristic matches, call _resume_from_checkpoint",
+    "3. Run normal prologue, then restore counters + todo + pending tool calls",
+    "4. Inject resume note and synthetic assistant tool_calls message",
+    "5. Persist resumed messages so state survives gateway restart",
+    "6. Gateway asks user (or auto-decides via keyword/classification) before resuming"
+  ],
+  "constraints_satisfied": {
+    "no_evolution_engine": true,
+    "no_self_modification": true,
+    "no_autonomous_coding": true,
+    "state_db_only": true
+  }
+}

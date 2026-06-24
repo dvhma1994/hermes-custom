@@ -1,0 +1,9 @@
+name: reflection
+version: 1.0.0
+description: "Reflexion-style self-reflection. After a tool/verification failure in the just-executed batch, injects a brief root-cause + alternative-approach nudge into the NEXT turn — via the user message only, so the system prompt (and prompt cache) is untouched. Flag-gated HERMES_REFLECTION=1, fail-open no-op when off. Improves decision quality on retries; injects at most once per turn and only when a real failure is detected."
+author: hermes-custom
+kind: standalone
+requires_env:
+  - HERMES_REFLECTION
+provides_hooks:
+  - pre_llm_call

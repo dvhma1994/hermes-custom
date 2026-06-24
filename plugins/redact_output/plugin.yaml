@@ -1,0 +1,9 @@
+name: redact-output
+version: 1.0.0
+description: "Defensive secret-redaction on the agent's OUTGOING text. Scans each final response (via the transform_llm_output hook) for high-signal credential shapes — GitHub/OpenAI/Slack/Google/AWS keys, JWTs, PEM private keys, Sakana fish_ keys — and replaces them with typed placeholders before the reply is sent. Flag-gated HERMES_REDACT_OUTPUT=1, fail-open no-op when off (returns None → text unchanged). Strict patterns only, so placeholders like gho_example are not touched."
+author: hermes-custom
+kind: standalone
+requires_env:
+  - HERMES_REDACT_OUTPUT
+provides_hooks:
+  - transform_llm_output

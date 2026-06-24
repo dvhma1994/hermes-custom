@@ -1,0 +1,9 @@
+name: auto-index
+version: 1.0.0
+description: "Keeps the semantic-recall vector index fresh. On each new session start (on_session_start hook — once per session, not per turn), runs an incremental, idempotent backfill of recent messages into the isolated sidecar index in a daemon thread, so hybrid recall / skill_search / session_search stay current over time without manual re-indexing. Flag-gated HERMES_AUTO_INDEX=1; also requires HERMES_SEMANTIC_RECALL=1 and a reachable embedder to do anything (otherwise a clean no-op). Fail-open; never blocks session start."
+author: hermes-custom
+kind: standalone
+requires_env:
+  - HERMES_AUTO_INDEX
+provides_hooks:
+  - on_session_start
